@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dashboard</title>
+  <link rel="stylesheet" href="dashboard.css" />
+</head>
+<body>
+  <h1>Welcome, <span id="user-name"></span></h1>
+  <img id="user-pic" width="100" style="border-radius: 50%; display: none;" alt="Profile Picture" />
+  <br />
+  <button id="logout-btn">Logout</button>
+
+  <hr style="margin: 30px 0" />
+
+  <form id="meeting-form" style="max-width: 500px; margin: auto;">
+    <label>
+        Meeting Date:
+        <input type="date" id="meeting-date" required />
+    </label>
+    <br /><br />
+    <label>
+        Meeting Time:
+        <input type="time" id="meeting-time" required />
+    </label>
+
+    <br /><br />
+
+    <label>
+      Meeting Link (URL):
+      <input type="url" id="meeting-link" placeholder="https://meet.google.com/xyz-abc" required />
+    </label>
+    <br /><br />
+
+    <label>
+      Google Drive Folder Link:
+      <input type="url" id="drive-folder-link" placeholder="https://drive.google.com/drive/folders/..." required />
+    </label>
+    <br /><br />
+
+    <button type="submit">Create Meeting Assistance</button>
+  </form>
+
+  <h2 style="max-width: 500px; margin: 30px auto 10px auto;">Your Meetings</h2>
+  <ul id="meetings-list" style="max-width: 500px; margin: auto; padding-left: 0;"></ul>
+
+  <script type="module" src="firebase_logged.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://apis.google.com/js/api.js"></script>
+
+
+
+</body>
+</html>
+

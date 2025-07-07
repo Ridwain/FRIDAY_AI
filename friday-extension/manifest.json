@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Friday Meeting Assistant Login",
+  "version": "1.0",
+  "description": "Firebase login for Friday Meeting Assistant",
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "friday.png",
+      "48": "friday.png",
+      "128": "friday.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "storage",
+    "identity",
+    "activeTab", 
+    "scripting" 
+  ],
+  "host_permissions": [
+    "https://friday-e65f2.web.app/*",
+    "https://www.googleapis.com/*",
+    "https://*.google.com/*", 
+    "https://meet.google.com/*",
+     "https://*.zoom.us/*",
+    "https://*.zoom.com/*"
+  ],
+  "oauth2": {
+    "client_id": "837567341884-p2ri11n3tv2ha5l7v59rmd62p50iocu1.apps.googleusercontent.com",
+    "scopes": ["profile", "email"]
+  },
+  "icons": {
+    "16": "friday.png"
+  }
+}
