@@ -29,8 +29,8 @@
     "https://*.zoom.com/*"
   ],
   "oauth2": {
-    "client_id": "837567341884-p2ri11n3tv2ha5l7v59rmd62p50iocu1.apps.googleusercontent.com",
-    "scopes": ["profile", "email"]
+    "client_id": "837567341884-crat3qdlnqf60gbe5cgjlludjeti81r4.apps.googleusercontent.com",
+    "scopes": ["profile", "email" , "https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/userinfo.email"]
   },
   "icons": {
     "16": "friday.png"

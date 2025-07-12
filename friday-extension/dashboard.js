@@ -2,6 +2,7 @@
 import { auth, db } from './firebase-config.js';
 import { signOut } from './firebase/firebase-auth.js';
 import { collection, getDocs } from './firebase/firebase-firestore.js';
+import { getAIResponse } from './ai-helper.js';
 
 const welcome = document.getElementById("welcome");
 const meetingsDiv = document.getElementById("meetings");
@@ -13,96 +14,124 @@ const closeChat = document.getElementById("closeChat");
 const micBtn = document.getElementById("micBtn");
 const voiceReplyToggle = document.getElementById("voiceReplyToggle");
 
-// Speech synthesis (output) - This remains in dashboard.js for replying
+// Speech synthesis (output)
 const synth = window.speechSynthesis;
 
+function formatDate(dateStr) {
+  const options = { year: 'numeric', month: 'long', day: 'numeric' };
+  return new Date(dateStr).toLocaleDateString('en-US', options);
+}
+
 // -------------------------------------------------------------------
-// Speech Recognition (Input) Logic - Handled by injected content.js
-// No direct SpeechRecognition initialization here anymore.
+// Speech Recognition handled by content.js
 // -------------------------------------------------------------------
 
-let activeTabId = null; // To store the ID of the tab where content.js is injected
-let isMicActive = false; // To track mic status based on messages from content.js
+let activeTabId = null; // Tab ID for injected content.js
+let isMicActive = false; // Mic state from content.js messages
+let selectedMeeting = null; // Clicked meeting
 
-// Function to inject content script into a relevant tab
-// Now returns true if successful, false otherwise
+function extractFolderId(driveUrl) {
+  const match = driveUrl.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+  return match ? match[1] : null;
+}
+
+async function searchFilesRecursively(folderId, queryText, token) {
+  const matches = [];
+
+  async function searchFolder(folderId) {
+    const url = `https://www.googleapis.com/drive/v3/files?q='${folderId}'+in+parents&fields=files(id,name,mimeType,webViewLink)&supportsAllDrives=true&includeItemsFromAllDrives=true`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const data = await res.json();
+
+    if (!data.files || !Array.isArray(data.files)) {
+      console.error("Drive API returned error or no files:", data);
+      return;
+    }
+
+    for (const file of data.files) {
+      if (file.name.toLowerCase().includes(queryText.toLowerCase())) {
+        matches.push(file);
+      }
+      if (file.mimeType === "application/vnd.google-apps.folder") {
+        await searchFolder(file.id);
+      }
+    }
+  }
+
+  await searchFolder(folderId);
+  return matches;
+}
+
 async function injectContentScript() {
-  // Query for an active tab that is any Google page
   const tabs = await chrome.tabs.query({
     active: true,
     currentWindow: true,
-    url: ["*://*.google.com/*",
-          "*://*.zoom.us/*",    // Any Zoom.us domain
-          "*://*.zoom.com/*"     // Any Zoom.com domain
-        ]
+    url: [
+      "*://*.google.com/*",
+      "*://*.zoom.us/*",
+      "*://*.zoom.com/*"
+    ]
   });
 
   if (tabs.length === 0) {
     alert("Voice features require an open Google page (e.g., google.com, meet.google.com, drive.google.com) in the current window.");
-    activeTabId = null; // Ensure activeTabId is null if no suitable tab
-    return false; // Indicate failure
+    activeTabId = null;
+    return false;
   }
 
-  activeTabId = tabs[0].id; // Store the ID of the chosen tab
+  activeTabId = tabs[0].id;
 
   try {
-    // Inject content.js into the identified tab
     await chrome.scripting.executeScript({
       target: { tabId: activeTabId },
       files: ['content.js']
     });
-    console.log("content.js injected successfully into tab:", activeTabId);
-    return true; // Indicate success
+    console.log("content.js injected into tab:", activeTabId);
+    return true;
   } catch (error) {
     console.error("Failed to inject content.js:", error);
-    alert("Failed to initialize voice features. Please try refreshing the Google page or opening a new one.");
-    activeTabId = null; // Clear if injection failed
-    return false; // Indicate failure
+    alert("Failed to initialize voice features. Try refreshing or opening a new Google page.");
+    activeTabId = null;
+    return false;
   }
 }
 
-// -------------------------------------------------------------------
-// Message listeners from content.js (the actual mic handler)
-// -------------------------------------------------------------------
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "SPEECH_RESULT") {
-    // When content.js gets a transcript, put it in the chat input
     chatInput.value = message.transcript;
-    // Trigger the enter key event to process the input
     chatInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
   } else if (message.type === "MIC_STATUS") {
-    // Update mic button based on status from content.js
     if (message.status === "listening") {
       isMicActive = true;
-      micBtn.textContent = '●'; // Visual indicator: recording
+      micBtn.textContent = '●';
       micBtn.style.color = 'red';
       micBtn.title = 'Listening... Click to stop';
     } else {
       isMicActive = false;
-      micBtn.textContent = 'm'; // Visual indicator: idle
+      micBtn.textContent = 'm';
       micBtn.style.color = 'initial';
       micBtn.title = 'Speak your question';
     }
   } else if (message.type === "MIC_ERROR") {
-    isMicActive = false; // Reset state on error
+    isMicActive = false;
     micBtn.textContent = 'm';
     micBtn.style.color = 'initial';
     micBtn.title = 'Speak your question';
     alert("Voice input error: " + message.error);
-    console.error("Content Script Speech Recognition Error:", message.error);
+    console.error("Speech Recognition Error:", message.error);
   } else if (message.type === "MIC_UNSUPPORTED") {
     micBtn.disabled = true;
     micBtn.title = "Speech Recognition not supported in the active tab.";
-    console.warn("Speech Recognition not supported in the active tab.");
+    console.warn("Speech Recognition not supported.");
   }
-  // No need to sendResponse unless the content script is explicitly waiting for it.
 });
 
 // -------------------------------------------------------------------
-// Event Handlers
+// Load user info and meetings
 // -------------------------------------------------------------------
 
-// Load user info
 chrome.storage.local.get(["email", "uid"], async (result) => {
   if (!result.email || !result.uid) {
     welcome.innerText = "Not logged in.";
@@ -114,6 +143,8 @@ chrome.storage.local.get(["email", "uid"], async (result) => {
   const meetingsRef = collection(db, "users", result.uid, "meetings");
   const snapshot = await getDocs(meetingsRef);
 
+  meetingsDiv.innerHTML = ""; // Clear previous meetings
+
   snapshot.forEach(doc => {
     const data = doc.data();
     const div = document.createElement("div");
@@ -124,6 +155,7 @@ chrome.storage.local.get(["email", "uid"], async (result) => {
     `;
 
     div.onclick = () => {
+      selectedMeeting = data;
       meetingsDiv.innerHTML = `
         <h3>Meeting Details</h3>
         <p><strong>Date:</strong> ${data.meetingDate}</p>
@@ -137,12 +169,11 @@ chrome.storage.local.get(["email", "uid"], async (result) => {
       logoutBtn.style.display = "none";
 
       document.getElementById("backBtn").onclick = () => window.location.reload();
+      chrome.storage.local.set({ selectedMeetingForChat: data });
 
-      // CHANGE HERE: Open chat box unconditionally when "Ask AI" is clicked
       document.getElementById("openChatBtn").onclick = () => {
         chatContainer.style.display = "flex";
-        // NO LONGER CALL injectContentScript() here.
-        // It will be called when the mic button is first clicked.
+        // Mic injection handled on mic button click now
       };
     };
 
@@ -150,7 +181,7 @@ chrome.storage.local.get(["email", "uid"], async (result) => {
   });
 });
 
-// Logout
+// Logout handler
 logoutBtn.onclick = async () => {
   try {
     await signOut(auth);
@@ -161,14 +192,12 @@ logoutBtn.onclick = async () => {
   }
 };
 
-// Close chat
+// Close chat handler
 closeChat.onclick = () => {
   chatContainer.style.display = "none";
-  // If mic is active and content script was injected, try to stop it
   if (activeTabId && isMicActive) {
-    chrome.tabs.sendMessage(activeTabId, { type: "STOP_MIC" }).catch(e => console.error("Error stopping mic on chat close:", e));
+    chrome.tabs.sendMessage(activeTabId, { type: "STOP_MIC" }).catch(e => console.error("Error stopping mic:", e));
   }
-  // Reset state variables and button appearance
   activeTabId = null;
   isMicActive = false;
   micBtn.textContent = 'm';
@@ -176,80 +205,214 @@ closeChat.onclick = () => {
   micBtn.title = 'Speak your question';
 };
 
-// Handle text input
+function linkify(text) {
+  const urlPattern = /(https?:\/\/[^\s]+)/g;
+  return text.replace(urlPattern, (url) => {
+    const safeUrl = url.replace(/"/g, "&quot;");
+    return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${url}</a>`;
+  });
+}
+
+// -------------------------------------------------------------------
+// Chat input handler
+// -------------------------------------------------------------------
+
 chatInput.addEventListener("keydown", async (e) => {
-  if (e.key === "Enter") {
-    const input = chatInput.value.trim();
-    if (!input) return;
+  if (e.key !== "Enter") return;
 
-    const userBubble = document.createElement("div");
-    userBubble.className = "chat-bubble user-bubble";
-    userBubble.textContent = input;
-    chatMessages.appendChild(userBubble);
+  const input = chatInput.value.trim();
+  if (!input) return;
 
-    const aiBubble = document.createElement("div");
-    aiBubble.className = "chat-bubble ai-bubble";
-    aiBubble.textContent = "Thinking...";
-    chatMessages.appendChild(aiBubble);
+  // Create chat bubbles for user input and AI reply placeholder
+  const userBubble = document.createElement("div");
+  userBubble.className = "chat-bubble user-bubble";
+  userBubble.textContent = input;
+  chatMessages.appendChild(userBubble);
 
-    chatMessages.scrollTop = chatMessages.scrollHeight;
-    chatInput.value = "";
+  const aiBubble = document.createElement("div");
+  aiBubble.className = "chat-bubble ai-bubble";
+  aiBubble.textContent = "Thinking...";
+  chatMessages.appendChild(aiBubble);
 
-    setTimeout(() => {
-      const replyText = `AI (mock): I understand you're asking about "${input}"`;
-      aiBubble.textContent = replyText;
-      chatMessages.scrollTop = chatMessages.scrollHeight;
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  chatInput.value = "";
 
-      if (voiceReplyToggle.checked && synth) {
-        const utterance = new SpeechSynthesisUtterance(replyText);
-        utterance.lang = 'en-US';
-        synth.speak(utterance);
+  // EARLY RETURN if no meeting selected — avoids null errors later
+  if (!selectedMeeting) {
+    aiBubble.textContent = "⚠️ No meeting data found. Please select a meeting first.";
+    return;
+  }
+
+  // Safe to access selectedMeeting now
+  try {
+    // Prepare date objects and format them
+    const todayObj = new Date();
+    const meetingDateObj = new Date(selectedMeeting.meetingDate);
+
+    const today = formatDate(todayObj.toISOString().split("T")[0]);
+    const meetingDate = formatDate(meetingDateObj.toISOString().split("T")[0]);
+
+    let meetingContextNote = "";
+    if (meetingDateObj < todayObj && meetingDateObj.toDateString() !== todayObj.toDateString()) {
+      meetingContextNote = `This meeting happened on ${meetingDate}.`;
+    } else if (meetingDateObj.toDateString() === todayObj.toDateString()) {
+      meetingContextNote = `This meeting is happening today.`;
+    } else {
+      meetingContextNote = `This meeting is scheduled for ${meetingDate}.`;
+    }
+
+    // Handle "list files" style queries directly with Drive API
+    if (/\b(list|show|what|which|give|display).*(files|documents|items)\b/i.test(input)) {
+      const folderId = extractFolderId(selectedMeeting.driveFolderLink);
+      if (!folderId) {
+        aiBubble.innerHTML = "⚠️ Could not extract Drive folder ID.";
+        return;
       }
-    }, 1000);
+
+      const token = await getGoogleAccessToken();
+      const files = await searchFilesRecursively(folderId, "", token);
+
+      if (files.length === 0) {
+        aiBubble.innerHTML = "❌ No files found in this Drive folder.";
+      } else {
+        aiBubble.innerHTML = `<strong>The Drive folder contains ${files.length} file(s):</strong><br><br>` +
+          files.map(f => `🔹 <a href="${f.webViewLink}" target="_blank">${f.name}</a>`).join("<br>");
+      }
+
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+      return;
+    }
+
+    // Prepare messages for AI prompt
+    const messages = [
+      {
+        role: "system",
+        content: `You are a helpful meeting assistant. Today's date is ${today}.
+${meetingContextNote}
+Meeting Info:
+- Date: ${meetingDate}
+- Time: ${selectedMeeting.meetingTime}
+- Meeting Link: ${selectedMeeting.meetingLink}
+- Drive Folder: ${selectedMeeting.driveFolderLink}`
+      },
+      {
+        role: "user",
+        content: input
+      }
+    ];
+
+    // Handle 'find' keyword for file search within Drive folder
+    let aiReply = "";
+
+    if (input.toLowerCase().startsWith("find")) {
+      const queryText = input.slice(5).trim();
+
+      if (!selectedMeeting.driveFolderLink.includes("folders/")) {
+        aiReply = "⚠️ Drive folder link is missing or invalid.";
+      } else {
+        const folderId = selectedMeeting.driveFolderLink.split("/folders/")[1].split(/[?#]/)[0];
+        try {
+          const token = await getAuthToken();
+          const matches = await searchFilesRecursively(folderId, queryText, token);
+
+          if (matches.length > 0) {
+            aiReply = `🔍 Found ${matches.length} file(s):<br>` + matches.map(file =>
+              `<a href="https://drive.google.com/file/d/${file.id}/view" target="_blank">${file.name}</a>`
+            ).join("<br>");
+          } else {
+            aiReply = `❌ No files found matching "${queryText}" inside the Drive folder.`;
+          }
+        } catch (err) {
+          aiReply = "⚠️ Error searching Drive folder.";
+          console.error("Drive search error:", err);
+        }
+      }
+    } else {
+      aiReply = await getAIResponse(messages);
+    }
+
+    aiBubble.innerHTML = linkify(aiReply);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    // Optional voice reply
+    if (voiceReplyToggle.checked && synth) {
+      const spokenText = aiReply
+        .replace(/https:\/\/drive\.google\.com\/\S+/g, 'your Drive folder')
+        .replace(/https:\/\/meet\.google\.com\/\S+/g, 'your meeting link')
+        .replace(/https?:\/\/\S+/g, '[a link]');
+
+      const utterance = new SpeechSynthesisUtterance(spokenText);
+      utterance.lang = 'en-US';
+      synth.speak(utterance);
+    }
+
+  } catch (err) {
+    aiBubble.textContent = "⚠️ Failed to process your request.";
+    console.error("Error processing chat input:", err);
   }
 });
 
-// Voice input (mic button handler)
+
+// -------------------------------------------------------------------
+// Mic button click handler
+// -------------------------------------------------------------------
+
 micBtn.onclick = async () => {
-  // If the content script hasn't been injected yet (no activeTabId)
   if (!activeTabId) {
-    console.log("Mic button clicked: Content script not yet injected. Attempting injection.");
-    const injectionSuccessful = await injectContentScript(); // Await injection
-    if (!injectionSuccessful) {
-      console.log("Content script injection failed. Cannot proceed with mic operations.");
-      return; // Stop if injection failed (e.g., no Google page open)
+    console.log("Injecting content script on mic click...");
+    const success = await injectContentScript();
+    if (!success) {
+      console.log("Injection failed, aborting mic start.");
+      return;
     }
-    console.log("Content script injected successfully (on mic click). Proceeding with mic operations.");
   }
 
-  // Now that activeTabId is guaranteed to be set (or was already set),
-  // proceed with sending messages to the content script.
-  let response;
-  if (!isMicActive) { // If currently idle, try to start
-    response = await chrome.tabs.sendMessage(activeTabId, { type: "START_MIC" }).catch(e => {
-        console.error("Error sending START_MIC message:", e);
-        alert("Failed to send start command to microphone. Is the Google page still active?");
-        return { success: false, message: e.message }; // Return a failure response
-    });
-    if (response && response.success) {
-      console.log("Sent START_MIC message. Response:", response.message);
-      // isMicActive will be set by the MIC_STATUS message from content.js
-    } else if (response) {
-      console.error("Failed to start mic via content script:", response.message);
-      alert("Error starting microphone: " + response.message);
+  try {
+    if (!isMicActive) {
+      const response = await chrome.tabs.sendMessage(activeTabId, { type: "START_MIC" });
+      if (!response || !response.success) {
+        alert("Error starting microphone: " + (response?.message || "Unknown error"));
+        return;
+      }
+      console.log("Mic started.");
+    } else {
+      const response = await chrome.tabs.sendMessage(activeTabId, { type: "STOP_MIC" });
+      if (!response || !response.success) {
+        alert("Error stopping microphone: " + (response?.message || "Unknown error"));
+        return;
+      }
+      console.log("Mic stopped.");
     }
-  } else { // If currently listening, try to stop
-    response = await chrome.tabs.sendMessage(activeTabId, { type: "STOP_MIC" }).catch(e => {
-        console.error("Error sending STOP_MIC message:", e);
-        alert("Failed to send stop command to microphone.");
-        return { success: false, message: e.message }; // Return a failure response
-    });
-    if (response && response.success) {
-      console.log("Sent STOP_MIC message. Response:", response.message);
-      // isMicActive will be set by the MIC_STATUS message from content.js
-    } else if (response) {
-      console.error("Failed to stop mic via content script:", response.message);
-      alert("Error stopping microphone: " + response.message);
-    }
+  } catch (e) {
+    console.error("Error communicating with content script:", e);
+    alert("Mic command failed. Is the Google page still open?");
   }
 };
+
+// -------------------------------------------------------------------
+// Helper functions to get Google OAuth tokens
+// -------------------------------------------------------------------
+
+export async function getGoogleAccessToken() {
+  return new Promise((resolve, reject) => {
+    chrome.identity.getAuthToken({ interactive: true }, (token) => {
+      if (chrome.runtime.lastError || !token) {
+        reject(chrome.runtime.lastError || new Error("Token missing"));
+      } else {
+        resolve(token);
+      }
+    });
+  });
+}
+
+function getAuthToken() {
+  return new Promise((resolve, reject) => {
+    chrome.identity.getAuthToken({ interactive: true }, (token) => {
+      if (chrome.runtime.lastError || !token) {
+        reject(chrome.runtime.lastError || new Error("Token missing"));
+      } else {
+        resolve(token);
+      }
+    });
+  });
+}
