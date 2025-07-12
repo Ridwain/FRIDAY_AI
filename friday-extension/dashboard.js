@@ -32,6 +32,7 @@ function loadMeetingList(uid) {
     meetingsDiv.innerHTML = '';
     snapshot.forEach(doc => {
       const data = doc.data();
+      data.meetingId = doc.id;
       const div = document.createElement("div");
       div.className = "meeting-card";
       div.innerHTML = `

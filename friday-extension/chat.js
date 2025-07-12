@@ -1,4 +1,7 @@
 // chat.js
+import { db } from './firebase-config.js';
+import { collection, addDoc, serverTimestamp, query, orderBy, getDocs } from './firebase/firebase-firestore.js';
+
 document.addEventListener("DOMContentLoaded", () => {
   import('./ai-helper.js').then(({ getAIResponse }) => {
     const chatMessages = document.getElementById("chatMessages");
@@ -10,6 +13,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let recognition;
     let isMicActive = false;
     let selectedMeeting = null;
+    let userUid = null;
     let isProcessing = false;
 
     function initSpeechRecognition() {
@@ -64,13 +68,19 @@ document.addEventListener("DOMContentLoaded", () => {
       });
     }
 
-    chrome.storage.local.get("selectedMeetingForChat", (result) => {
-      if (result.selectedMeetingForChat) {
-        selectedMeeting = result.selectedMeetingForChat;
-      } else {
-        alert("No meeting selected. Please open chat from the dashboard after selecting a meeting.");
-      }
-    });
+    chrome.storage.local.get(["selectedMeetingForChat", "uid"], async (result) => {
+  if (result.selectedMeetingForChat && result.uid) {
+    selectedMeeting = result.selectedMeetingForChat;
+    userUid = result.uid;
+
+    if (selectedMeeting.meetingId) {
+      await loadChatHistory(userUid, selectedMeeting.meetingId); // 🔁 Load chat
+    }
+  } else {
+    alert("No meeting selected. Please open chat from the dashboard after selecting a meeting.");
+  }
+});
+
 
     async function searchFilesRecursively(folderId, queryText, token) {
       const matches = [];
@@ -122,7 +132,7 @@ document.addEventListener("DOMContentLoaded", () => {
         });
       });
     }
-
+    
     function getMeetingStatus(meetingDateStr) {
       const today = new Date();
       const meetingDate = new Date(meetingDateStr);
@@ -134,6 +144,39 @@ document.addEventListener("DOMContentLoaded", () => {
       if (meetingOnly < todayOnly) return "in the past";
       return "upcoming";
     }
+//** 
+    async function saveChatMessage(uid, meetingId, role, content) {
+        try {
+            const chatRef = collection(db, "users", uid, "meetings", meetingId, "chats");
+            await addDoc(chatRef, {
+            role,
+            content,
+            timestamp: serverTimestamp()
+            });
+        } catch (err) {
+            console.error("❌ Failed to save chat message:", err);
+        }
+    }
+
+    async function loadChatHistory(uid, meetingId) {
+  const chatRef = collection(db, "users", uid, "meetings", meetingId, "chats");
+  const q = query(chatRef, orderBy("timestamp", "asc"));
+
+  try {
+    const snapshot = await getDocs(q);
+    snapshot.forEach(doc => {
+      const { role, content } = doc.data();
+      const bubble = document.createElement("div");
+      bubble.className = `chat-bubble ${role === "user" ? "user-bubble" : "ai-bubble"}`;
+      bubble.innerHTML = linkify(content);
+      chatMessages.appendChild(bubble);
+    });
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  } catch (err) {
+    console.error("❌ Failed to load chat history:", err);
+  }
+}
+
 
     chatInput.addEventListener("keydown", async (e) => {
       if (e.key !== "Enter" || isProcessing) return;
@@ -149,6 +192,11 @@ document.addEventListener("DOMContentLoaded", () => {
       userBubble.className = "chat-bubble user-bubble";
       userBubble.textContent = input;
       chatMessages.appendChild(userBubble);
+
+      if (userUid && selectedMeeting.meetingId) {
+  saveChatMessage(userUid, selectedMeeting.meetingId, "user", input);
+}
+
 
       const aiBubble = document.createElement("div");
       aiBubble.className = "chat-bubble ai-bubble";
@@ -283,6 +331,10 @@ Be brief and friendly. Only use meeting info when relevant.`
         const aiReply = await getAIResponse(messages);
         aiBubble.innerHTML = linkify(aiReply);
         chatMessages.scrollTop = chatMessages.scrollHeight;
+        
+        if (userUid && selectedMeeting.meetingId) {
+  saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", aiReply);
+}
 
         if (voiceReplyToggle.checked && synth) {
           if (synth.speaking) synth.cancel();

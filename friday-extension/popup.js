@@ -100,6 +100,7 @@ async function loadMeetings(uid) {
 
   snapshot.forEach(doc => {
     const data = doc.data();
+    data.meetingId = doc.id;
     const div = document.createElement("div");
     div.style.marginBottom = "10px";
     div.innerHTML = `
