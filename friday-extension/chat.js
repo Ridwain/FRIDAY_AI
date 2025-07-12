@@ -226,13 +226,23 @@ document.addEventListener("DOMContentLoaded", () => {
           const files = await searchFilesRecursively(folderId, "", token);
 
           if (files.length === 0) {
-            aiBubble.innerHTML = "No files found inside your Drive folder.";
-          } else {
+                aiBubble.innerHTML = "No files found inside your Drive folder.";
+            if (userUid && selectedMeeting.meetingId) {
+                saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", "No files found inside your Drive folder.");
+            }
+        } else {
             aiBubble.innerHTML = `<b>Files in your Drive folder:</b><br>` + 
-              files.map(f =>
-                `<div>📄 <a href="${f.webViewLink}" target="_blank" rel="noopener noreferrer">${f.name}</a></div>`
-              ).join("");
-          }
+            files.map(f =>
+             `<div>📄 <a href="${f.webViewLink}" target="_blank" rel="noopener noreferrer">${f.name}</a></div>`
+            ).join("");
+
+        if (userUid && selectedMeeting.meetingId) {
+            const fileListText = files.map(f => `📄 ${f.name}`).join("\n");
+            const replyToSave = `Files in your Drive folder:\n${fileListText}`;
+            saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", replyToSave);
+        }
+}
+
         } catch (err) {
           if (err && err.status === 403) {
             aiBubble.innerHTML = `
@@ -331,7 +341,7 @@ Be brief and friendly. Only use meeting info when relevant.`
         const aiReply = await getAIResponse(messages);
         aiBubble.innerHTML = linkify(aiReply);
         chatMessages.scrollTop = chatMessages.scrollHeight;
-        
+
         if (userUid && selectedMeeting.meetingId) {
   saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", aiReply);
 }
