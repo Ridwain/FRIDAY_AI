@@ -5,13 +5,9 @@ import {
   signInWithPopup
 } from './firebase/firebase-auth.js';
 
-const isLocalhost = window.location.hostname.includes("localhost") || window.location.hostname === "127.0.0.1";
-
 const firebaseConfig = {
   apiKey: "AIzaSyCQkiNi5bsfoOUxj9HsxDupXR7SmUHGKPI",
-  authDomain: isLocalhost
-    ? "friday-e65f2.firebaseapp.com"
-    : "friday-e65f2.web.app",
+  authDomain: "friday-e65f2.web.app",
   projectId: "friday-e65f2",
   storageBucket: "friday-e65f2.appspot.com",
   messagingSenderId: "837567341884",
@@ -22,17 +18,20 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const provider = new GoogleAuthProvider();
 
+// 🧠 THIS must run immediately after page load
 signInWithPopup(auth, provider)
   .then(result => {
     const user = result.user;
+
+    // Send info back to background script
     chrome.runtime.sendMessage({
       type: "LOGIN_SUCCESS",
       email: user.email,
       uid: user.uid
     });
-    window.location.href = "dashboard.html";
 
+    window.close(); // Close popup after success
   })
-  .catch(error => {
-    console.error("Google login failed:", error.message);
+  .catch(err => {
+    console.error("Google sign-in error:", err.message);
   });

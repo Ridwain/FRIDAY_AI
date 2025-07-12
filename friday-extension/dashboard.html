@@ -1,15 +1,26 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="UTF-8" />
   <title>Dashboard</title>
   <style>
     body {
       font-family: 'Segoe UI', sans-serif;
       margin: 0;
-      padding: 20px;
+      width: 500px;
+      height: 500px;
+      position: relative;
       background-color: #f4f4f4;
-      height: auto;
-      overflow-x: hidden;
+      overflow: visible;
+      /* remove padding here */
+    }
+
+    #container {
+      padding: 20px;
+      height: calc(100% - 60px);
+      /* leave space for buttons */
+      overflow-y: auto;
+      box-sizing: border-box;
     }
 
     .meeting-card {
@@ -19,6 +30,7 @@
       cursor: pointer;
       border-radius: 8px;
       background-color: #f9f9f9;
+      transition: background-color 0.2s ease;
     }
 
     .meeting-card:hover {
@@ -26,127 +38,80 @@
     }
 
     #meetings {
-      max-height: 70vh;
+      max-height: 300px;
       overflow-y: auto;
       margin-bottom: 20px;
     }
 
-    #chatContainer {
-      display: none;
-      position: fixed;
-      top: 0px;
-      bottom: 0px;
-      right: 20px;
-      width: 320px;
-      height: 320px;
-      border: 1px solid #aaa;
-      border-radius: 10px;
-      background: #ffffff;
-      z-index: 999;
-      box-shadow: 0 0 10px rgba(0,0,0,0.2);
-      flex-direction: column;
-      overflow: hidden;
-      padding-bottom: 10px;
-    }
-
-    #chatHeader {
-      background-color: #333;
-      color: white;
-      padding: 10px;
-      font-weight: bold;
-      border-radius: 10px 10px 0 0;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-shrink: 0;
-    }
-
-    #chatMessages {
-      padding: 10px;
-      flex: 1;
-      overflow-y: auto;
-      background: #f5f5f5;
-      font-size: 14px;
-      height: 230px;
-    }
-
-    #chatInput {
-      flex: 1;
-      border: none;
-      border-top: 1px solid #ccc;
-      padding: 10px;
-      font-size: 14px;
-      outline: none;
-    }
-
-    .chat-bubble {
-      padding: 8px 12px;
-      border-radius: 16px;
-      margin-bottom: 8px;
-      max-width: 80%;
-      word-wrap: break-word;
-    }
-
-    .user-bubble {
-      background-color: #d1e7dd;
-      margin-left: auto;
-      text-align: right;
-    }
-
-    .ai-bubble {
-      background-color: #e2e3e5;
-      margin-right: auto;
-    }
-
-    #backBtn {
-      margin-top: 50px;
-    }
-
     #logoutBtn {
-      margin-top: 20px;
-    }
-
-    #chatControls {
-      display: flex;
-      align-items: center;
-      padding: 10px;
-    }
-
-    #micBtn {
-      margin-left: 5px;
-      font-size: 18px;
-      cursor: pointer;
-      background: none;
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      padding: 8px 16px;
+      background-color: #222;
+      color: #fff;
       border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background-color 0.2s ease;
     }
 
-    #voiceReplyToggle {
-      margin: 10px;
+    #logoutBtn:hover {
+      background-color: #555;
+    }
+
+    /* Bottom buttons container fixed at bottom center */
+    #bottomButtons {
+      position: absolute;
+      bottom: 15px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 20px;
+      z-index: 1000;
+    }
+
+    #backBtn,
+    #openChatBtn {
+      padding: 8px 16px;
+      background-color: #222;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background-color 0.2s ease;
+      display: inline-flex;
+      /* changed from flex */
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      user-select: none;
+      white-space: nowrap;
+      /* prevent wrapping */
+    }
+
+    #backBtn:hover,
+    #openChatBtn:hover {
+      background-color: #555;
     }
   </style>
 </head>
-<body>
-  <h2 id="welcome">Loading...</h2>
-  <div id="meetings"></div>
-  <button id="logoutBtn">Logout</button>
 
-  <!-- AI Chatbox -->
-  <div id="chatContainer">
-    <div id="chatHeader">
-      <span>AI Assistant</span>
-      <button id="closeChat" style="background:none;border:none;color:white;font-size:16px;cursor:pointer;">close X</button>
-    </div>
-    <div id="chatMessages"></div>
-    <div id="chatControls">
-      <input id="chatInput" type="text" placeholder="Ask about the meeting..." />
-      <button id="micBtn" title="Speak your question">m</button>
-    </div>
-    <label style="padding-left:10px;">
-      <input type="checkbox" id="voiceReplyToggle" />
-      Enable voice replies
-    </label>
+<body>
+  <div id="container">
+    <h2 id="welcome">Loading...</h2>
+    <div id="meetings"></div>
+    <button id="logoutBtn">Logout</button>
   </div>
 
+  <div id="bottomButtons" style="display:none;">
+    <button id="backBtn" title="Back to all meetings">⬅️ Back to Meetings</button>
+    <button id="openChatBtn" title="Ask AI">🤖 Ask AI</button>
+  </div>
   <script type="module" src="dashboard.js"></script>
 </body>
+
+
 </html>
