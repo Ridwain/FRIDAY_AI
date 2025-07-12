@@ -1,3 +1,4 @@
+// chat.js
 document.addEventListener("DOMContentLoaded", () => {
   import('./ai-helper.js').then(({ getAIResponse }) => {
     const chatMessages = document.getElementById("chatMessages");
@@ -9,6 +10,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let recognition;
     let isMicActive = false;
     let selectedMeeting = null;
+    let isProcessing = false;
 
     function initSpeechRecognition() {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -55,7 +57,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function linkify(text) {
-      const urlPattern = /(https?:\/\/[^\s]+)/g;
+      const urlPattern = /https?:\/\/[^\s"<>]+/g;
       return text.replace(urlPattern, (url) => {
         const safeUrl = url.replace(/"/g, "&quot;");
         return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${url}</a>`;
@@ -65,8 +67,6 @@ document.addEventListener("DOMContentLoaded", () => {
     chrome.storage.local.get("selectedMeetingForChat", (result) => {
       if (result.selectedMeetingForChat) {
         selectedMeeting = result.selectedMeetingForChat;
-
-
       } else {
         alert("No meeting selected. Please open chat from the dashboard after selecting a meeting.");
       }
@@ -83,14 +83,22 @@ document.addEventListener("DOMContentLoaded", () => {
             Authorization: `Bearer ${token}`,
           }
         });
+
+        if (res.status === 403) {
+          const err = new Error("Access denied to Drive folder");
+          err.status = 403;
+          throw err;
+        }
+
         const data = await res.json();
+
         if (!data.files || !Array.isArray(data.files)) {
           console.error("Drive API error or no files:", data);
           return;
         }
 
         for (const file of data.files) {
-          if (file.name.toLowerCase().includes(queryText.toLowerCase())) {
+          if (!queryText || file.name.toLowerCase().includes(queryText.toLowerCase())) {
             matches.push(file);
           }
           if (file.mimeType === "application/vnd.google-apps.folder") {
@@ -115,11 +123,27 @@ document.addEventListener("DOMContentLoaded", () => {
       });
     }
 
+    function getMeetingStatus(meetingDateStr) {
+      const today = new Date();
+      const meetingDate = new Date(meetingDateStr);
+
+      const todayOnly = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+      const meetingOnly = new Date(meetingDate.getFullYear(), meetingDate.getMonth(), meetingDate.getDate());
+
+      if (meetingOnly.getTime() === todayOnly.getTime()) return "today";
+      if (meetingOnly < todayOnly) return "in the past";
+      return "upcoming";
+    }
 
     chatInput.addEventListener("keydown", async (e) => {
-      if (e.key !== "Enter") return;
+      if (e.key !== "Enter" || isProcessing) return;
+      isProcessing = true;
+
       const input = chatInput.value.trim();
-      if (!input) return;
+      if (!input) {
+        isProcessing = false;
+        return;
+      }
 
       const userBubble = document.createElement("div");
       userBubble.className = "chat-bubble user-bubble";
@@ -136,14 +160,53 @@ document.addEventListener("DOMContentLoaded", () => {
 
       if (!selectedMeeting) {
         aiBubble.textContent = "⚠️ No meeting data found. Please select a meeting first.";
+        isProcessing = false;
         return;
       }
 
-      if (/find|search|look.*for/i.test(input)) {
-        const keyword = input.split(" ").pop();
+      // Show all files in drive folder on specific command
+      const showFilesQuery = /\b(show|list|display) (me )?(the )?(drive folder|documents|files|docs|drive files)\b/i;
+      if (showFilesQuery.test(input)) {
         const folderId = extractFolderId(selectedMeeting.driveFolderLink);
         if (!folderId) {
           aiBubble.innerHTML = "⚠️ Could not extract Drive folder ID.";
+          isProcessing = false;
+          return;
+        }
+        try {
+          const token = await getAuthToken();
+          const files = await searchFilesRecursively(folderId, "", token);
+
+          if (files.length === 0) {
+            aiBubble.innerHTML = "No files found inside your Drive folder.";
+          } else {
+            aiBubble.innerHTML = `<b>Files in your Drive folder:</b><br>` + 
+              files.map(f =>
+                `<div>📄 <a href="${f.webViewLink}" target="_blank" rel="noopener noreferrer">${f.name}</a></div>`
+              ).join("");
+          }
+        } catch (err) {
+          if (err && err.status === 403) {
+            aiBubble.innerHTML = `
+              ⚠️ Access denied to the Drive folder.<br>
+              Please <a href="${selectedMeeting.driveFolderLink}" target="_blank" rel="noopener noreferrer">request access here</a> and then try again.
+            `;
+          } else {
+            console.error("Drive API error:", err);
+            aiBubble.textContent = "❌ Error accessing Google Drive.";
+          }
+        }
+        isProcessing = false;
+        return;
+      }
+
+      // Search for specific files by keyword
+      if (/find|search|look.*for/i.test(input)) {
+        const keyword = input.match(/["“](.*?)["”]/)?.[1] || input.replace(/.*\b(find|search|look.*for)\b/i, '').trim();
+        const folderId = extractFolderId(selectedMeeting.driveFolderLink);
+        if (!folderId) {
+          aiBubble.innerHTML = "⚠️ Could not extract Drive folder ID.";
+          isProcessing = false;
           return;
         }
         try {
@@ -169,23 +232,49 @@ document.addEventListener("DOMContentLoaded", () => {
             }, 0);
           }
           chatMessages.scrollTop = chatMessages.scrollHeight;
-          return;
         } catch (err) {
           console.error("Drive search error:", err);
           aiBubble.textContent = "❌ Error searching Google Drive.";
-          return;
         }
+        isProcessing = false;
+        return;
       }
+
+      // Meeting date formatting and status
+      const today = new Date();
+      const todayFormatted = today.toLocaleDateString("en-US", {
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+      });
+
+      const meetingDateFormatted = new Date(selectedMeeting.meetingDate).toLocaleDateString("en-US", {
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+      });
+
+      const meetingStatus = getMeetingStatus(selectedMeeting.meetingDate);
+
+      // Check if input is related to meeting context (to decide system prompt)
+      const meetingKeywordsRegex = /\b(meeting|date|time|link|schedule|when|where)\b/i;
+      const includeMeetingContext = meetingKeywordsRegex.test(input);
 
       const messages = [
         {
           role: "system",
-          content: `You are a helpful meeting assistant. Meeting context:
-        - Date: ${selectedMeeting.meetingDate}
-        - Time: ${selectedMeeting.meetingTime}
-        - Meeting Link: ${selectedMeeting.meetingLink}
-        - Drive Folder: ${selectedMeeting.driveFolderLink}
-        Only use this info if relevant to the user's question. Be brief and helpful.`
+          content: includeMeetingContext
+            ? `You are a helpful and polite meeting assistant.
+Today's date is ${todayFormatted}.
+Meeting context:
+- Meeting Date: ${meetingDateFormatted} (${meetingStatus})
+- Meeting Time: ${selectedMeeting.meetingTime}
+- Meeting Link: ${selectedMeeting.meetingLink}
+- Drive Folder: ${selectedMeeting.driveFolderLink}
+
+If the user asks whether the meeting is today, respond naturally:
+- If it's today: "Yes, the meeting is today at [time]."
+- If it's past: "The meeting was scheduled for [date], so it already took place."
+- If it's upcoming: "The meeting is scheduled for [date] at [time]."
+
+Be brief and friendly. Only use meeting info when relevant.`
+            : `You are a helpful assistant. Only mention meeting details if the user asks about them explicitly. Answer the user question directly and concisely.`,
         },
         { role: "user", content: input }
       ];
@@ -196,18 +285,43 @@ document.addEventListener("DOMContentLoaded", () => {
         chatMessages.scrollTop = chatMessages.scrollHeight;
 
         if (voiceReplyToggle.checked && synth) {
+          if (synth.speaking) synth.cancel();
+
           const spokenText = aiReply
             .replace(/https:\/\/drive\.google\.com\/\S+/g, 'your Drive folder')
             .replace(/https:\/\/meet\.google\.com\/\S+/g, 'your meeting link')
             .replace(/https?:\/\/\S+/g, '[a link]');
-          const utterance = new SpeechSynthesisUtterance(spokenText);
-          utterance.lang = 'en-US';
-          synth.speak(utterance);
+
+          function getPreferredVoice() {
+            const voices = synth.getVoices();
+            return (
+              voices.find(v => v.lang.startsWith('en') && v.name.includes('Google US English')) ||
+              voices.find(v => v.lang.startsWith('en')) ||
+              voices[0]
+            );
+          }
+
+          function speakNow() {
+            const utterance = new SpeechSynthesisUtterance(spokenText);
+            utterance.lang = 'en-US';
+            utterance.voice = getPreferredVoice();
+            utterance.pitch = 1;
+            utterance.rate = 1;
+            utterance.volume = 1;
+            synth.speak(utterance);
+          }
+
+          if (synth.getVoices().length === 0) {
+            synth.addEventListener('voiceschanged', speakNow);
+          } else {
+            speakNow();
+          }
         }
       } catch (err) {
         aiBubble.textContent = "⚠️ Failed to get AI response.";
         console.error("AI error:", err);
       }
+      isProcessing = false;
     });
 
     micBtn.onclick = () => {
@@ -249,8 +363,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     window.addEventListener("beforeunload", () => {
       chrome.storage.local.remove("chatWindowId");
-
     });
 
     initSpeechRecognition();
-  });})
+  });
+}); 
