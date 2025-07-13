@@ -105,6 +105,23 @@
       padding-left: 4px;
     }
 
+    #sendBtn {
+      width: 60px;
+      height: 30px;
+      font-size: 14px;
+      background-color: #222;
+      border: none;
+      color: #fff;
+      border-radius: 6px;
+      cursor: pointer;
+      user-select: none;
+      transition: background-color 0.2s ease;
+    }
+
+    #sendBtn:hover {
+      background-color: #444;
+    }
+
     .chat-bubble {
       padding: 10px 16px;
       border-radius: 20px;
@@ -138,6 +155,7 @@
   <div id="chatMessages"></div>
   <div id="chatInputArea">
     <input id="chatInput" type="text" placeholder="Type your question..." autocomplete="off" />
+    <button id="sendBtn">Send</button>
     <button id="micBtn" title="Toggle microphone">🎤</button>
     <div id="voiceReplyToggleContainer">
       <input type="checkbox" id="voiceReplyToggle" />
@@ -147,3 +165,5 @@
 
   <script type="module" src="chat.js" defer></script>
 </body>
+
+</html>
