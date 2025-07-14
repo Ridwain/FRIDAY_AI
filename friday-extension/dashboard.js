@@ -107,30 +107,50 @@ function openOrFocusChatWindow() {
   });
 }
 
+
 function launchChatWindow() {
   const chatWidth = 400;
   const chatHeight = 500;
 
-  // Calculate bottom-right position
   const screenWidth = screen.availWidth;
   const screenHeight = screen.availHeight;
 
-  const left = screenWidth - chatWidth - 10;  // 10px from right edge
-  const top = screenHeight - chatHeight - 10; // 10px from bottom edge
+  const left = screenWidth - chatWidth - 10;
+  const top = screenHeight - chatHeight - 10;
+
   chrome.windows.create({
-    url: "chat.html",
-    type: "popup",
+    url: chrome.runtime.getURL("chat.html"),
+    type: "popup", // Still required
+    focused: true,
     width: chatWidth,
     height: chatHeight,
     left: left,
     top: top
   }, (win) => {
-    if (win && win.id !== undefined) {
-      chrome.storage.local.set({ chatWindowId: win.id });
-    }
+    if (!win || !win.id) return;
+
+    // Fix for macOS: forcibly resize again
+    chrome.windows.update(win.id, {
+      width: chatWidth,
+      height: chatHeight,
+      left: left,
+      top: top,
+      focused: true
+    });
+
+    // Optional: store window ID for reuse or cleanup
+    chrome.storage.local.set({ chatWindowId: win.id });
   });
 }
 
+// Triggered when "🤖 Ask AI" button is clicked
+document.getElementById("openChatBtn").onclick = () => {
+    if (!selectedMeeting) {
+      alert("Please select a meeting first."); 
+      return;
+    }
+    openOrFocusChatWindow(); // Calls the function to open or focus the chat window
+};
 logoutBtn.onclick = async () => {
   try {
     await signOut(auth);
