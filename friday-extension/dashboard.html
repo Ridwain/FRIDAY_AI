@@ -12,13 +12,11 @@
       position: relative;
       background-color: #f4f4f4;
       overflow: visible;
-      /* remove padding here */
     }
 
     #container {
       padding: 20px;
       height: calc(100% - 60px);
-      /* leave space for buttons */
       overflow-y: auto;
       box-sizing: border-box;
     }
@@ -61,7 +59,6 @@
       background-color: #555;
     }
 
-    /* Bottom buttons container fixed at bottom center */
     #bottomButtons {
       position: absolute;
       bottom: 15px;
@@ -73,7 +70,8 @@
     }
 
     #backBtn,
-    #openChatBtn {
+    #openChatBtn,
+    #transcriptionBtn {
       padding: 8px 16px;
       background-color: #222;
       color: #fff;
@@ -83,17 +81,16 @@
       font-size: 14px;
       transition: background-color 0.2s ease;
       display: inline-flex;
-      /* changed from flex */
       align-items: center;
       justify-content: center;
       gap: 8px;
       user-select: none;
       white-space: nowrap;
-      /* prevent wrapping */
     }
 
     #backBtn:hover,
-    #openChatBtn:hover {
+    #openChatBtn:hover,
+    #transcriptionBtn:hover {
       background-color: #555;
     }
   </style>
@@ -109,9 +106,8 @@
   <div id="bottomButtons" style="display:none;">
     <button id="backBtn" title="Back to all meetings">⬅️ Back to Meetings</button>
     <button id="openChatBtn" title="Ask AI">🤖 Ask AI</button>
+    <button id="transcriptionBtn" title="Start Transcription">🎙️ Start Transcription</button>
   </div>
   <script type="module" src="dashboard.js"></script>
 </body>
-
-
 </html>

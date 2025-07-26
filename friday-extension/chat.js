@@ -1,5 +1,5 @@
 import { db } from './firebase-config.js';
-import { collection, addDoc, serverTimestamp, query, orderBy, getDocs } from './firebase/firebase-firestore.js';
+import { collection, addDoc, serverTimestamp, query, orderBy, getDocs, getDoc } from './firebase/firebase-firestore.js';
 
 document.addEventListener("DOMContentLoaded", () => {
   import('./ai-helper.js').then(({ getAIResponse }) => {
@@ -9,7 +9,6 @@ document.addEventListener("DOMContentLoaded", () => {
     const voiceReplyToggle = document.getElementById("voiceReplyToggle");
     const sendBtn = document.getElementById("sendBtn");
 
-    // Check for missing DOM elements
     if (!chatMessages) {
       console.error("Error: Element with id 'chatMessages' not found in the DOM.");
       return;
@@ -34,7 +33,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let selectedMeeting = null;
     let userUid = null;
     let isProcessing = false;
-    const filesContentMap = {}; // Store file contents for quick lookup
+    const filesContentMap = {};
 
     function initSpeechRecognition() {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -87,7 +86,7 @@ document.addEventListener("DOMContentLoaded", () => {
     function linkify(text) {
       const urlPattern = /https?:\/\/[^\s"<>]+/g;
       return text.replace(urlPattern, (url) => {
-        const safeUrl = url.replace(/"/g, ""); // Corrected: empty string replacement
+        const safeUrl = url.replace(/"/g, "");
         return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${url}</a>`;
       });
     }
@@ -234,6 +233,19 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
 
+    async function loadTranscript(uid, meetingId) {
+      const transcriptRef = collection(db, "users", uid, "meetings", meetingId, "transcripts");
+      const snapshot = await getDocs(transcriptRef);
+      let transcriptContent = "";
+      snapshot.forEach(doc => {
+        const data = doc.data();
+        if (data.content) {
+          transcriptContent += data.content + "\n";
+        }
+      });
+      return transcriptContent.trim();
+    }
+
     chrome.storage.local.get(["selectedMeetingForChat", "uid"], async (result) => {
       if (result.selectedMeetingForChat && result.uid) {
         selectedMeeting = result.selectedMeetingForChat;
@@ -258,12 +270,10 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
       }
 
-      // Clear input immediately
       console.log("Clearing input, current value:", chatInput.value);
       chatInput.value = "";
-      chatInput.focus(); // Force UI update
+      chatInput.focus();
 
-      // Check for file content question
       const fileQuestionMatch = input.toLowerCase().match(/what\s+is\s+inside\s+([\w.\-]+\.\w+)/);
       if (fileQuestionMatch) {
         const filename = fileQuestionMatch[1].toLowerCase();
@@ -311,7 +321,6 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!selectedMeeting) {
           aiBubble.textContent = "⚠️ No meeting data found. Please select a meeting first.";
         } else {
-          // Show all files in drive folder on specific command
           const showFilesQuery = /\b(show|list|display) (me )?(the )?(drive folder|documents|files|docs|drive files)\b/i;
           if (showFilesQuery.test(input)) {
             const folderId = extractFolderId(selectedMeeting.driveFolderLink);
@@ -328,7 +337,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", "No files found inside your Drive folder.");
                   }
                 } else {
-                  aiBubble.innerHTML = `<b>Files in your Drive folder:</b><br>` + 
+                  aiBubble.innerHTML = `<b>Files in your Drive folder:</b><br>` +
                     files.map(f =>
                       `<div>📄 <a href="${f.webViewLink}" target="_blank" rel="noopener noreferrer">${f.name}</a></div>`
                     ).join("");
@@ -386,7 +395,6 @@ document.addEventListener("DOMContentLoaded", () => {
               }
             }
           } else {
-            // Fetch Drive file content
             let fileContext = "";
             try {
               const folderId = extractFolderId(selectedMeeting.driveFolderLink);
@@ -409,7 +417,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     content = await downloadGoogleDocAsText(file.id, token);
                   }
                   const fileKey = file.name.toLowerCase();
-                  filesContentMap[fileKey] = content; // Populate filesContentMap
+                  filesContentMap[fileKey] = content;
                   console.log("Mapped file:", fileKey, "with content length:", content.length);
                   const chunks = splitText(content);
                   fileTexts.push(`File: ${file.name}\n${chunks.slice(0, 3).join("\n")}`);
@@ -421,7 +429,17 @@ document.addEventListener("DOMContentLoaded", () => {
               console.warn("Error loading Drive files:", err);
             }
 
-            // Meeting date formatting and status
+            let transcriptContext = "";
+            try {
+              transcriptContext = await loadTranscript(userUid, selectedMeeting.meetingId);
+              if (!transcriptContext) {
+                transcriptContext = "No transcript available for this meeting.";
+              }
+            } catch (err) {
+              console.warn("Error loading transcript:", err);
+              transcriptContext = "Failed to load meeting transcript.";
+            }
+
             const today = new Date();
             const todayFormatted = today.toLocaleDateString("en-US", {
               weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
@@ -433,8 +451,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
             const meetingStatus = getMeetingStatus(selectedMeeting.meetingDate);
 
-            // Check if input is related to meeting context
-            const meetingKeywordsRegex = /\b(meeting|date|time|link|schedule|when|where)\b/i;
+            const meetingKeywordsRegex = /\b(meeting|date|time|link|schedule|when|where|discussed|talked about|conversation)\b/i;
             const includeMeetingContext = meetingKeywordsRegex.test(input);
 
             const messages = [
@@ -446,6 +463,8 @@ You are a helpful meeting assistant.
 Today's date is ${todayFormatted}. Use this date directly when asked about it, without referencing any sources.
 
 ${fileContext ? "Here are some contents from the user's Drive folder, to be used only when relevant to the user's question:\n\n" + fileContext : ""}
+
+${transcriptContext ? "Here is the transcript of the meeting, to be used when the user asks about what was discussed or meeting content:\n\n" + transcriptContext : "No meeting transcript available."}
 
 ${includeMeetingContext ? `
 Meeting context (use only if explicitly asked about):
@@ -460,7 +479,7 @@ If the user asks whether the meeting is today, respond naturally:
 - If it's upcoming: "The meeting is scheduled for [date] at [time]."
 ` : "Only mention meeting details if the user asks about them explicitly."}
 
-Be brief and friendly. Use Drive folder or meeting info only when directly relevant.
+Be brief and friendly. Use Drive folder or meeting transcript only when directly relevant. If the question is unrelated to the provided context, respond with "I can't find an answer to this question."
                 `.trim()
               },
               { role: "user", content: input }
@@ -476,7 +495,7 @@ Be brief and friendly. Use Drive folder or meeting info only when directly relev
               }
 
               if (voiceReplyToggle && voiceReplyToggle.checked && synth) {
-                if (synth.speaking) synth.cancel(); // Cancel any ongoing speech
+                if (synth.speaking) synth.cancel();
 
                 const spokenText = aiReply
                   .replace(/https:\/\/drive\.google\.com\/\S+/g, 'your Drive folder')
@@ -520,7 +539,6 @@ Be brief and friendly. Use Drive folder or meeting info only when directly relev
       isProcessing = false;
     });
 
-    // Add event listener to stop voice reply when toggle is unchecked
     if (voiceReplyToggle) {
       voiceReplyToggle.addEventListener("change", () => {
         if (!voiceReplyToggle.checked && synth.speaking) {
@@ -530,7 +548,6 @@ Be brief and friendly. Use Drive folder or meeting info only when directly relev
       });
     }
 
-    // Add event listener for send button
     if (sendBtn) {
       sendBtn.addEventListener("click", () => {
         if (isProcessing || !chatInput.value.trim()) return;
