@@ -1,3 +1,4 @@
+//dashboard.js
 import { auth, db } from './firebase-config.js';
 import { signOut } from './firebase/firebase-auth.js';
 import { collection, getDocs, addDoc, setDoc, doc, serverTimestamp } from './firebase/firebase-firestore.js';
@@ -9,13 +10,73 @@ const transcriptionBtn = document.getElementById("transcriptionBtn");
 
 let selectedMeeting = null;
 let isTranscribing = false;
-let recognition;
-let transcriptDocRef;
-let accumulatedTranscript = "";
-let audioContext;
-let outputGain;
 
 document.getElementById('bottomButtons').style.display = 'none';
+
+// Notify background script that extension page is available
+chrome.runtime.sendMessage({ type: "EXTENSION_PAGE_CONNECTED" });
+
+// Listen for transcription status updates from background script
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "TRANSCRIPTION_STATUS_UPDATE") {
+    isTranscribing = message.isTranscribing;
+    updateTranscriptionButton();
+  } else if (message.type === "TRANSCRIPTION_ERROR") {
+    isTranscribing = false;
+    updateTranscriptionButton();
+    alert("Transcription error: " + message.error);
+  } else if (message.type === "SAVE_TRANSCRIPT_REQUEST") {
+    // Handle transcript saving request from background script
+    saveTranscriptToFirebase(message.uid, message.meetingId, message.transcript);
+  } else if (message.type === "PROCESS_TRANSCRIPT_QUEUE") {
+    // Process queued transcripts
+    processQueuedTranscripts(message.queue);
+  }
+});
+
+async function processQueuedTranscripts(queue) {
+  for (const item of queue) {
+    await saveTranscriptToFirebase(item.uid, item.meetingId, item.transcript);
+  }
+  console.log(`Processed ${queue.length} queued transcripts`);
+  
+  // Also check for any transcripts stored in chrome.storage
+  await processStoredTranscripts();
+}
+
+async function processStoredTranscripts() {
+  try {
+    const allData = await chrome.storage.local.get();
+    const transcriptKeys = Object.keys(allData).filter(key => key.startsWith('transcript_'));
+    
+    for (const key of transcriptKeys) {
+      const [, uid, meetingId] = key.split('_');
+      const transcript = allData[key];
+      
+      if (transcript && transcript.trim()) {
+        await saveTranscriptToFirebase(uid, meetingId, transcript);
+        // Remove from storage after successful save
+        await chrome.storage.local.remove(key);
+        console.log(`Processed stored transcript for meeting ${meetingId}`);
+      }
+    }
+  } catch (error) {
+    console.error("Error processing stored transcripts:", error);
+  }
+}
+
+async function saveTranscriptToFirebase(uid, meetingId, transcript) {
+  try {
+    const transcriptDocRef = doc(collection(db, "users", uid, "meetings", meetingId, "transcripts"));
+    await setDoc(transcriptDocRef, { 
+      content: transcript, 
+      timestamp: serverTimestamp() 
+    }, { merge: true });
+    console.log("Transcript saved successfully");
+  } catch (err) {
+    console.error("Failed to save transcript:", err);
+  }
+}
 
 chrome.storage.local.get(["email", "uid", "selectedMeetingForChat"], async (result) => {
   if (!result.email || !result.uid) {
@@ -28,6 +89,13 @@ chrome.storage.local.get(["email", "uid", "selectedMeetingForChat"], async (resu
 
   if (selectedMeeting) {
     showMeetingDetails(selectedMeeting);
+    // Check current transcription status
+    chrome.runtime.sendMessage({ type: "GET_TRANSCRIPTION_STATUS" }, (response) => {
+      if (response) {
+        isTranscribing = response.isTranscribing;
+        updateTranscriptionButton();
+      }
+    });
   } else {
     loadMeetingList(result.uid);
   }
@@ -105,6 +173,18 @@ function showMeetingDetails(data) {
   chrome.storage.local.set({ selectedMeetingForChat: data });
 }
 
+function updateTranscriptionButton() {
+  if (isTranscribing) {
+    transcriptionBtn.textContent = "🎙️ Stop Transcription";
+    transcriptionBtn.title = "Stop Transcription (Running in Background)";
+    transcriptionBtn.style.backgroundColor = "#d9534f"; // Red color when active
+  } else {
+    transcriptionBtn.textContent = "🎙️ Start Transcription";
+    transcriptionBtn.title = "Start Transcription";
+    transcriptionBtn.style.backgroundColor = "#222"; // Default color
+  }
+}
+
 function openOrFocusChatWindow() {
   chrome.storage.local.get("chatWindowId", ({ chatWindowId }) => {
     if (chatWindowId) {
@@ -156,96 +236,47 @@ function startTranscription() {
     return;
   }
 
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) {
-    alert("Speech Recognition not supported in this browser.");
-    return;
-  }
-
-  chrome.tabs.query({ url: "*://meet.google.com/*" }, (tabs) => {
-    if (!tabs.length) {
-      alert("Please open the Google Meet meeting in a tab.");
+  chrome.storage.local.get(["uid"], (result) => {
+    if (!result.uid) {
+      alert("User not logged in.");
       return;
     }
 
-    const meetTab = tabs[0];
-    chrome.tabCapture.capture({
-      audio: true,
-      video: false
-    }, (stream) => {
-      if (chrome.runtime.lastError || !stream) {
-        alert("Failed to capture audio: " + (chrome.runtime.lastError?.message || "Unknown error"));
-        return;
+    // Send message to background script to start transcription
+    chrome.runtime.sendMessage({
+      type: "START_TRANSCRIPTION",
+      meeting: selectedMeeting,
+      uid: result.uid
+    }, (response) => {
+      if (response && response.success) {
+        isTranscribing = true;
+        updateTranscriptionButton();
+      } else {
+        alert("Failed to start transcription");
       }
-
-      audioContext = new AudioContext();
-      const source = audioContext.createMediaStreamSource(stream);
-      outputGain = audioContext.createGain();
-      source.connect(outputGain);
-      outputGain.connect(audioContext.destination); // Ensure audio remains audible
-
-      recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = "en-US";
-
-      transcriptDocRef = doc(collection(db, "users", auth.currentUser.uid, "meetings", selectedMeeting.meetingId, "transcripts"));
-      accumulatedTranscript = "";
-
-      recognition.onresult = (event) => {
-        let interimTranscript = "";
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            accumulatedTranscript += transcript + " ";
-            setDoc(transcriptDocRef, { content: accumulatedTranscript, timestamp: serverTimestamp() }, { merge: true })
-              .catch(err => console.error("Failed to save transcript:", err));
-          } else {
-            interimTranscript += transcript;
-          }
-        }
-      };
-
-      recognition.onerror = (e) => {
-        console.error("Speech error:", e.error);
-        alert("Transcription error: " + e.error);
-        stopTranscription();
-      };
-
-      recognition.onend = () => {
-        if (isTranscribing) {
-          recognition.start(); // Restart to keep continuous transcription
-        }
-      };
-
-      recognition.start();
-      isTranscribing = true;
-      transcriptionBtn.textContent = "🎙️ Stop Transcription";
-      transcriptionBtn.title = "Stop Transcription";
     });
   });
 }
 
 function stopTranscription() {
-  if (recognition) {
-    recognition.stop();
-    recognition = null;
-  }
-  if (audioContext) {
-    audioContext.close();
-    audioContext = null;
-  }
-  if (outputGain) {
-    outputGain.disconnect();
-    outputGain = null;
-  }
-  isTranscribing = false;
-  transcriptionBtn.textContent = "🎙️ Start Transcription";
-  transcriptionBtn.title = "Start Transcription";
+  // Send message to background script to stop transcription
+  chrome.runtime.sendMessage({
+    type: "STOP_TRANSCRIPTION"
+  }, (response) => {
+    if (response && response.success) {
+      isTranscribing = false;
+      updateTranscriptionButton();
+    }
+  });
 }
 
 logoutBtn.onclick = async () => {
   try {
+    // Stop transcription if running
+    if (isTranscribing) {
+      stopTranscription();
+    }
+    
     await signOut(auth);
     chrome.storage.local.get("chatWindowId", ({ chatWindowId }) => {
       if (chatWindowId) {

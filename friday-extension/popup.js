@@ -1,8 +1,95 @@
 chrome.storage.local.get(["email", "uid"], (result) => {
   if (result.email && result.uid) {
     window.location.href = "dashboard.html";
+  } else {
+    // Notify background script that extension page is available
+    chrome.runtime.sendMessage({ type: "EXTENSION_PAGE_CONNECTED" });
   }
 });
+
+// Add message listener for transcript processing
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "PROCESS_TRANSCRIPT_QUEUE") {
+    // Process queued transcripts
+    processQueuedTranscripts(message.queue);
+    sendResponse({success: true});
+  } else if (message.type === "SAVE_TRANSCRIPT_REQUEST") {
+    // Handle direct transcript saving request
+    saveTranscriptToFirebase(message.uid, message.meetingId, message.transcript);
+    sendResponse({success: true});
+  }
+});
+
+// Function to process queued transcripts
+async function processQueuedTranscripts(queue) {
+  const { db } = await import('./firebase-config.js');
+  const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
+  
+  for (const item of queue) {
+    try {
+      const transcriptDocRef = doc(collection(db, "users", item.uid, "meetings", item.meetingId, "transcripts"));
+      await setDoc(transcriptDocRef, { 
+        content: item.transcript, 
+        timestamp: serverTimestamp() 
+      }, { merge: true });
+      console.log(`Processed queued transcript for meeting ${item.meetingId}`);
+    } catch (error) {
+      console.error("Error processing queued transcript:", error);
+    }
+  }
+  
+  // Also process any stored transcripts
+  await processStoredTranscripts();
+}
+
+// Function to process transcripts stored in chrome.storage
+async function processStoredTranscripts() {
+  try {
+    const allData = await chrome.storage.local.get();
+    const transcriptKeys = Object.keys(allData).filter(key => key.startsWith('transcript_'));
+    
+    if (transcriptKeys.length > 0) {
+      const { db } = await import('./firebase-config.js');
+      const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
+      
+      for (const key of transcriptKeys) {
+        const [, uid, meetingId] = key.split('_');
+        const transcript = allData[key];
+        
+        if (transcript && transcript.trim()) {
+          const transcriptDocRef = doc(collection(db, "users", uid, "meetings", meetingId, "transcripts"));
+          await setDoc(transcriptDocRef, { 
+            content: transcript, 
+            timestamp: serverTimestamp() 
+          }, { merge: true });
+          
+          // Remove from storage after successful save
+          await chrome.storage.local.remove(key);
+          console.log(`Processed stored transcript for meeting ${meetingId}`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Error processing stored transcripts:", error);
+  }
+}
+
+// Function to save transcript to Firebase (for direct requests)
+async function saveTranscriptToFirebase(uid, meetingId, transcript) {
+  try {
+    const { db } = await import('./firebase-config.js');
+    const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
+    
+    const transcriptDocRef = doc(collection(db, "users", uid, "meetings", meetingId, "transcripts"));
+    await setDoc(transcriptDocRef, { 
+      content: transcript, 
+      timestamp: serverTimestamp() 
+    }, { merge: true });
+    console.log("Transcript saved successfully via popup");
+  } catch (err) {
+    console.error("Failed to save transcript:", err);
+  }
+}
 
 import { auth, db } from './firebase-config.js';
 import {

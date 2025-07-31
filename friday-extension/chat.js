@@ -1,7 +1,126 @@
 import { db } from './firebase-config.js';
-import { collection, addDoc, serverTimestamp, query, orderBy, getDocs, getDoc } from './firebase/firebase-firestore.js';
+import { collection, addDoc, serverTimestamp, query, orderBy, getDocs, getDoc, doc, setDoc } from './firebase/firebase-firestore.js';
 
 document.addEventListener("DOMContentLoaded", () => {
+  // Notify background script that extension page is available
+  chrome.runtime.sendMessage({ type: "EXTENSION_PAGE_CONNECTED" });
+
+  // Add message listener for transcript queue processing
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === "PROCESS_TRANSCRIPT_QUEUE") {
+      // Process queued transcripts
+      processQueuedTranscripts(message.queue);
+      sendResponse({success: true});
+    } else if (message.type === "SAVE_TRANSCRIPT_REQUEST") {
+      // Handle direct transcript saving request
+      saveTranscriptToFirebase(message.uid, message.meetingId, message.transcript);
+      sendResponse({success: true});
+    }
+    // ... other existing message handlers
+    else if (message.type === "SPEECH_RESULT") {
+      chatInput.value = message.transcript;
+      chatInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+    } else if (message.type === "MIC_STATUS") {
+      if (micBtn) {
+        if (message.status === "listening") {
+          isMicActive = true;
+          micBtn.textContent = '●';
+          micBtn.style.color = 'red';
+          micBtn.title = 'Listening... Click to stop';
+        } else {
+          isMicActive = false;
+          micBtn.textContent = '🎤';
+          micBtn.style.color = '';
+          micBtn.title = 'Speak your question';
+        }
+      }
+    } else if (message.type === "MIC_ERROR") {
+      isMicActive = false;
+      if (micBtn) {
+        micBtn.textContent = '🎤';
+        micBtn.style.color = '';
+        micBtn.title = 'Speak your question';
+      }
+      alert("Voice input error: " + message.error);
+    } else if (message.type === "MIC_UNSUPPORTED") {
+      if (micBtn) {
+        micBtn.disabled = true;
+        micBtn.title = "Speech Recognition not supported in active tab.";
+      }
+    }
+  });
+
+  // Function to process queued transcripts
+  async function processQueuedTranscripts(queue) {
+    const { db } = await import('./firebase-config.js');
+    const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
+    
+    for (const item of queue) {
+      try {
+        const transcriptDocRef = doc(collection(db, "users", item.uid, "meetings", item.meetingId, "transcripts"));
+        await setDoc(transcriptDocRef, { 
+          content: item.transcript, 
+          timestamp: serverTimestamp() 
+        }, { merge: true });
+        console.log(`Processed queued transcript for meeting ${item.meetingId}`);
+      } catch (error) {
+        console.error("Error processing queued transcript:", error);
+      }
+    }
+    
+    // Also process any stored transcripts
+    await processStoredTranscripts();
+  }
+
+  // Function to process transcripts stored in chrome.storage
+  async function processStoredTranscripts() {
+    try {
+      const allData = await chrome.storage.local.get();
+      const transcriptKeys = Object.keys(allData).filter(key => key.startsWith('transcript_'));
+      
+      if (transcriptKeys.length > 0) {
+        const { db } = await import('./firebase-config.js');
+        const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
+        
+        for (const key of transcriptKeys) {
+          const [, uid, meetingId] = key.split('_');
+          const transcript = allData[key];
+          
+          if (transcript && transcript.trim()) {
+            const transcriptDocRef = doc(collection(db, uid, "meetings", meetingId, "transcripts"));
+            await setDoc(transcriptDocRef, { 
+              content: transcript, 
+              timestamp: serverTimestamp() 
+            }, { merge: true });
+            
+            // Remove from storage after successful save
+            await chrome.storage.local.remove(key);
+            console.log(`Processed stored transcript for meeting ${meetingId}`);
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Error processing stored transcripts:", error);
+    }
+  }
+
+  // Function to save transcript to Firebase (for direct requests)
+  async function saveTranscriptToFirebase(uid, meetingId, transcript) {
+    try {
+      const { db } = await import('./firebase-config.js');
+      const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
+      
+      const transcriptDocRef = doc(collection(db, "users", uid, "meetings", meetingId, "transcripts"));
+      await setDoc(transcriptDocRef, { 
+        content: transcript, 
+        timestamp: serverTimestamp() 
+      }, { merge: true });
+      console.log("Transcript saved successfully via chat window");
+    } catch (err) {
+      console.error("Failed to save transcript:", err);
+    }
+  }
+
   import('./ai-helper.js').then(({ getAIResponse }) => {
     const chatMessages = document.getElementById("chatMessages");
     const chatInput = document.getElementById("chatInput");
@@ -565,40 +684,6 @@ Be brief and friendly. Use Drive folder or meeting transcript only when directly
         }
       };
     }
-
-    chrome.runtime.onMessage.addListener((message) => {
-      if (message.type === "SPEECH_RESULT") {
-        chatInput.value = message.transcript;
-        chatInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
-      } else if (message.type === "MIC_STATUS") {
-        if (micBtn) {
-          if (message.status === "listening") {
-            isMicActive = true;
-            micBtn.textContent = '●';
-            micBtn.style.color = 'red';
-            micBtn.title = 'Listening... Click to stop';
-          } else {
-            isMicActive = false;
-            micBtn.textContent = '🎤';
-            micBtn.style.color = '';
-            micBtn.title = 'Speak your question';
-          }
-        }
-      } else if (message.type === "MIC_ERROR") {
-        isMicActive = false;
-        if (micBtn) {
-          micBtn.textContent = '🎤';
-          micBtn.style.color = '';
-          micBtn.title = 'Speak your question';
-        }
-        alert("Voice input error: " + message.error);
-      } else if (message.type === "MIC_UNSUPPORTED") {
-        if (micBtn) {
-          micBtn.disabled = true;
-          micBtn.title = "Speech Recognition not supported in active tab.";
-        }
-      }
-    });
 
     window.addEventListener("beforeunload", () => {
       chrome.storage.local.remove("chatWindowId");
