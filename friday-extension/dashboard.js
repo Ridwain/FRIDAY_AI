@@ -1,7 +1,7 @@
 //dashboard.js
 import { auth, db } from './firebase-config.js';
 import { signOut } from './firebase/firebase-auth.js';
-import { collection, getDocs, addDoc, setDoc, doc, serverTimestamp } from './firebase/firebase-firestore.js';
+import { collection, getDocs, addDoc, setDoc, doc, serverTimestamp, updateDoc } from './firebase/firebase-firestore.js';
 
 const welcome = document.getElementById("welcome");
 const meetingsDiv = document.getElementById("meetings");
@@ -25,15 +25,120 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     isTranscribing = false;
     updateTranscriptionButton();
     alert("Transcription error: " + message.error);
-  } else if (message.type === "SAVE_TRANSCRIPT_REQUEST") {
-    // Handle transcript saving request from background script
+  } 
+  // Handle new single-document transcript operations
+  else if (message.type === "INIT_TRANSCRIPT_DOC") {
+    initializeTranscriptDocument(message.uid, message.meetingId, message.docId, message.startTime, message.status);
+    sendResponse({success: true});
+  } else if (message.type === "UPDATE_TRANSCRIPT_DOC") {
+    updateTranscriptDocument(message.uid, message.meetingId, message.docId, message.transcript, message.lastUpdated, message.status);
+    sendResponse({success: true});
+  } else if (message.type === "FINALIZE_TRANSCRIPT_DOC") {
+    finalizeTranscriptDocument(message.uid, message.meetingId, message.docId, message.transcript, message.endTime, message.wordCount, message.status);
+    sendResponse({success: true});
+  }
+  // Handle legacy transcript operations for backward compatibility
+  else if (message.type === "SAVE_TRANSCRIPT_REQUEST") {
+    // Handle transcript saving request from background script (legacy)
     saveTranscriptToFirebase(message.uid, message.meetingId, message.transcript);
+    sendResponse({success: true});
   } else if (message.type === "PROCESS_TRANSCRIPT_QUEUE") {
-    // Process queued transcripts
+    // Process queued transcripts (legacy)
     processQueuedTranscripts(message.queue);
+    sendResponse({success: true});
   }
 });
 
+// Function to initialize a new transcript document
+async function initializeTranscriptDocument(uid, meetingId, docId, startTime, status) {
+  try {
+    const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+    await setDoc(transcriptDocRef, {
+      transcript: "",
+      startTime: startTime,
+      lastUpdated: startTime,
+      status: status,
+      wordCount: 0,
+      createdAt: serverTimestamp()
+    });
+    console.log(`Initialized transcript document: ${docId}`);
+  } catch (error) {
+    console.error("Error initializing transcript document:", error);
+    // Fallback to chrome.storage
+    await storeTranscriptInStorage(uid, meetingId, docId, {
+      transcript: "",
+      startTime: startTime,
+      status: status
+    });
+  }
+}
+
+// Function to update transcript document in real-time
+async function updateTranscriptDocument(uid, meetingId, docId, transcript, lastUpdated, status) {
+  try {
+    const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+    
+    // Use setDoc with merge: true to ensure document exists
+    await setDoc(transcriptDocRef, {
+      transcript: transcript,
+      lastUpdated: lastUpdated,
+      status: status,
+      wordCount: transcript.trim().split(/\s+/).filter(word => word.length > 0).length
+    }, { merge: true });
+    
+    console.log(`Updated transcript document: ${docId} (${transcript.length} chars)`);
+  } catch (error) {
+    console.error("Error updating transcript document:", error);
+    // Fallback to chrome.storage
+    await storeTranscriptInStorage(uid, meetingId, docId, {
+      transcript: transcript,
+      lastUpdated: lastUpdated,
+      status: status
+    });
+  }
+}
+
+// Function to finalize transcript document
+async function finalizeTranscriptDocument(uid, meetingId, docId, transcript, endTime, wordCount, status) {
+  try {
+    const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+    
+    // Use setDoc with merge: true instead of updateDoc to ensure document exists
+    await setDoc(transcriptDocRef, {
+      transcript: transcript,
+      endTime: endTime,
+      status: status,
+      wordCount: wordCount,
+      finalizedAt: serverTimestamp()
+    }, { merge: true });
+    
+    console.log(`Finalized transcript document: ${docId} (${wordCount} words)`);
+  } catch (error) {
+    console.error("Error finalizing transcript document:", error);
+    // Fallback to chrome.storage
+    await storeTranscriptInStorage(uid, meetingId, docId, {
+      transcript: transcript,
+      endTime: endTime,
+      status: status,
+      wordCount: wordCount
+    });
+  }
+}
+
+// Fallback storage function
+async function storeTranscriptInStorage(uid, meetingId, docId, data) {
+  try {
+    const storageKey = `transcript_${uid}_${meetingId}_${docId}`;
+    await chrome.storage.local.set({
+      [storageKey]: data
+    });
+    console.log("Transcript stored in chrome.storage as backup:", storageKey);
+  } catch (error) {
+    console.error("Failed to store transcript in storage:", error);
+  }
+}
+
+// Legacy functions for backward compatibility
 async function processQueuedTranscripts(queue) {
   for (const item of queue) {
     await saveTranscriptToFirebase(item.uid, item.meetingId, item.transcript);
@@ -50,14 +155,44 @@ async function processStoredTranscripts() {
     const transcriptKeys = Object.keys(allData).filter(key => key.startsWith('transcript_'));
     
     for (const key of transcriptKeys) {
-      const [, uid, meetingId] = key.split('_');
-      const transcript = allData[key];
-      
-      if (transcript && transcript.trim()) {
-        await saveTranscriptToFirebase(uid, meetingId, transcript);
-        // Remove from storage after successful save
-        await chrome.storage.local.remove(key);
-        console.log(`Processed stored transcript for meeting ${meetingId}`);
+      const parts = key.split('_');
+      if (parts.length >= 4) {
+        // New format: transcript_uid_meetingId_docId
+        const [, uid, meetingId, docId] = parts;
+        const data = allData[key];
+        
+        if (data && typeof data === 'object') {
+          const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+          await setDoc(transcriptDocRef, {
+            transcript: data.transcript || "",
+            startTime: data.startTime,
+            endTime: data.endTime,
+            lastUpdated: data.lastUpdated,
+            status: data.status || 'completed',
+            wordCount: data.wordCount || 0,
+            createdAt: serverTimestamp()
+          });
+          
+          // Remove from storage after successful save
+          await chrome.storage.local.remove(key);
+          console.log(`Processed stored transcript: ${docId}`);
+        }
+      } else if (parts.length === 3) {
+        // Legacy format: transcript_uid_meetingId
+        const [, uid, meetingId] = parts;
+        const transcript = allData[key];
+        
+        if (transcript && transcript.trim()) {
+          const transcriptDocRef = doc(collection(db, "users", uid, "meetings", meetingId, "transcripts"));
+          await setDoc(transcriptDocRef, { 
+            content: transcript, 
+            timestamp: serverTimestamp() 
+          });
+          
+          // Remove from storage after successful save
+          await chrome.storage.local.remove(key);
+          console.log(`Processed legacy stored transcript for meeting ${meetingId}`);
+        }
       }
     }
   } catch (error) {

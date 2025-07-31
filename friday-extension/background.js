@@ -3,7 +3,8 @@ let transcriptionState = {
   isTranscribing: false,
   selectedMeeting: null,
   userUid: null,
-  meetTabId: null
+  meetTabId: null,
+  transcriptDocId: null // Store the document ID for the current session
 };
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -34,9 +35,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({isTranscribing: transcriptionState.isTranscribing});
   }
 
-  // Handle messages from content script
+  // Handle new transcript document messages
+  if (message.type === "INITIALIZE_TRANSCRIPT") {
+    initializeTranscriptDocument(message.uid, message.meetingId, message.startTime);
+  }
+
+  if (message.type === "UPDATE_TRANSCRIPT_REALTIME") {
+    updateTranscriptRealtime(message.uid, message.meetingId, message.transcript, message.lastUpdated);
+  }
+
+  if (message.type === "FINALIZE_TRANSCRIPT") {
+    finalizeTranscriptDocument(message.uid, message.meetingId, message.transcript, message.endTime, message.wordCount);
+  }
+
+  // Handle legacy messages for backward compatibility
   if (message.type === "TRANSCRIPTION_RESULT") {
-    handleTranscriptionResult(message.transcript, message.isFinal);
+    // Legacy handler - can be removed if not needed
+    console.log("Legacy transcription result received");
   }
 
   if (message.type === "TRANSCRIPTION_ERROR") {
@@ -50,8 +65,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   
   // Handle connection from extension pages
   if (message.type === "EXTENSION_PAGE_CONNECTED") {
-    // Process any queued transcripts
-    processTranscriptQueue();
     sendResponse({success: true});
   }
 });
@@ -64,6 +77,7 @@ async function startBackgroundTranscription(meeting, uid) {
 
   transcriptionState.selectedMeeting = meeting;
   transcriptionState.userUid = uid;
+  transcriptionState.transcriptDocId = null; // Reset document ID
 
   try {
     // Find Google Meet tab
@@ -120,87 +134,136 @@ async function stopBackgroundTranscription() {
 
   transcriptionState.isTranscribing = false;
   transcriptionState.meetTabId = null;
+  // ✅ DON'T reset transcriptDocId here - let it persist for finalization
   
   broadcastTranscriptionStatus("stopped");
 }
 
-function handleTranscriptionResult(transcript, isFinal) {
-  if (isFinal && transcriptionState.selectedMeeting && transcriptionState.userUid) {
-    // Save transcript to Firebase
-    saveTranscriptToFirebase(
-      transcriptionState.userUid,
-      transcriptionState.selectedMeeting.meetingId,
-      transcript
-    );
-  }
-}
-
-// Queue for storing transcripts when no extension pages are available
-let transcriptQueue = [];
-
-async function saveTranscriptToFirebase(uid, meetingId, transcript) {
+async function initializeTranscriptDocument(uid, meetingId, startTime) {
   try {
-    // Try to send to extension pages first
-    const messagePromise = chrome.runtime.sendMessage({
-      type: "SAVE_TRANSCRIPT_REQUEST",
+    // Only generate a new session ID if we don't already have one
+    if (!transcriptionState.transcriptDocId) {
+      const sessionId = `transcript_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      transcriptionState.transcriptDocId = sessionId;
+    }
+
+    // Send initialization request to extension pages
+    const initData = {
+      type: "INIT_TRANSCRIPT_DOC",
       uid: uid,
       meetingId: meetingId,
-      transcript: transcript
+      docId: transcriptionState.transcriptDocId,
+      startTime: startTime,
+      status: 'recording'
+    };
+
+    chrome.runtime.sendMessage(initData).catch(() => {
+      // If no extension pages are available, store in chrome.storage as backup
+      storeTranscriptInStorage(uid, meetingId, transcriptionState.transcriptDocId, {
+        transcript: "",
+        startTime: startTime,
+        status: 'recording',
+        lastUpdated: startTime
+      });
     });
 
-    try {
-      await messagePromise;
-      console.log("Transcript saved via extension page");
-    } catch (error) {
-      // No extension pages available, queue the transcript
-      console.log("Queueing transcript for later saving");
-      transcriptQueue.push({
-        uid: uid,
-        meetingId: meetingId,
-        transcript: transcript,
-        timestamp: Date.now()
-      });
-      
-      // Store in chrome.storage as backup
-      await storeTranscriptInStorage(uid, meetingId, transcript);
-    }
+    console.log("Initialized transcript document:", transcriptionState.transcriptDocId);
   } catch (error) {
-    console.error("Error saving transcript:", error);
-    // Fallback to storage
-    await storeTranscriptInStorage(uid, meetingId, transcript);
+    console.error("Error initializing transcript document:", error);
   }
 }
 
-async function storeTranscriptInStorage(uid, meetingId, transcript) {
+async function updateTranscriptRealtime(uid, meetingId, transcript, lastUpdated) {
+  // If no document ID yet (race condition), generate one immediately
+  if (!transcriptionState.transcriptDocId) {
+    console.log("No transcript document ID available, creating one now...");
+    const sessionId = `transcript_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    transcriptionState.transcriptDocId = sessionId;
+    
+    // Initialize the document first
+    await initializeTranscriptDocument(uid, meetingId, new Date().toISOString());
+  }
+
   try {
-    const storageKey = `transcript_${uid}_${meetingId}`;
-    const existingData = await chrome.storage.local.get(storageKey);
-    const currentTranscript = existingData[storageKey] || "";
-    
-    await chrome.storage.local.set({
-      [storageKey]: currentTranscript + transcript + " "
+    // Send update request to extension pages
+    const updateData = {
+      type: "UPDATE_TRANSCRIPT_DOC",
+      uid: uid,
+      meetingId: meetingId,
+      docId: transcriptionState.transcriptDocId,
+      transcript: transcript,
+      lastUpdated: lastUpdated,
+      status: 'recording'
+    };
+
+    chrome.runtime.sendMessage(updateData).catch(() => {
+      // If no extension pages are available, store in chrome.storage as backup
+      storeTranscriptInStorage(uid, meetingId, transcriptionState.transcriptDocId, {
+        transcript: transcript,
+        lastUpdated: lastUpdated,
+        status: 'recording'
+      });
     });
+
+    console.log("Updated transcript document with", transcript.length, "characters");
+  } catch (error) {
+    console.error("Error updating transcript document:", error);
+  }
+}
+
+async function finalizeTranscriptDocument(uid, meetingId, transcript, endTime, wordCount) {
+  // If no document ID yet (edge case), generate one and initialize
+  if (!transcriptionState.transcriptDocId) {
+    console.log("No transcript document ID available for finalization, creating one now...");
+    const sessionId = `transcript_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    transcriptionState.transcriptDocId = sessionId;
     
-    console.log("Transcript stored in chrome.storage as backup");
+    // Initialize the document first
+    await initializeTranscriptDocument(uid, meetingId, new Date().toISOString());
+  }
+
+  try {
+    // Send finalization request to extension pages
+    const finalData = {
+      type: "FINALIZE_TRANSCRIPT_DOC",
+      uid: uid,
+      meetingId: meetingId,
+      docId: transcriptionState.transcriptDocId,
+      transcript: transcript,
+      endTime: endTime,
+      wordCount: wordCount,
+      status: 'completed'
+    };
+
+    chrome.runtime.sendMessage(finalData).catch(() => {
+      // If no extension pages are available, store in chrome.storage as backup
+      storeTranscriptInStorage(uid, meetingId, transcriptionState.transcriptDocId, {
+        transcript: transcript,
+        endTime: endTime,
+        wordCount: wordCount,
+        status: 'completed'
+      });
+    });
+
+    console.log("Finalized transcript document:", transcriptionState.transcriptDocId);
+    
+    // ✅ NOW reset the transcriptDocId after successful finalization
+    transcriptionState.transcriptDocId = null;
+  } catch (error) {
+    console.error("Error finalizing transcript document:", error);
+  }
+}
+
+async function storeTranscriptInStorage(uid, meetingId, docId, data) {
+  try {
+    const storageKey = `transcript_${uid}_${meetingId}_${docId}`;
+    await chrome.storage.local.set({
+      [storageKey]: data
+    });
+    console.log("Transcript stored in chrome.storage as backup:", storageKey);
   } catch (error) {
     console.error("Failed to store transcript in storage:", error);
   }
-}
-
-// Process queued transcripts when extension pages become available
-function processTranscriptQueue() {
-  if (transcriptQueue.length === 0) return;
-  
-  chrome.runtime.sendMessage({
-    type: "PROCESS_TRANSCRIPT_QUEUE",
-    queue: transcriptQueue
-  }).then(() => {
-    console.log(`Processed ${transcriptQueue.length} queued transcripts`);
-    transcriptQueue = [];
-  }).catch(() => {
-    // Still no extension pages available
-    console.log("Extension pages still not available for queue processing");
-  });
 }
 
 function broadcastTranscriptionStatus(status) {

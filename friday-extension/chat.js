@@ -1,22 +1,34 @@
 import { db } from './firebase-config.js';
-import { collection, addDoc, serverTimestamp, query, orderBy, getDocs, getDoc, doc, setDoc } from './firebase/firebase-firestore.js';
+import { collection, addDoc, serverTimestamp, query, orderBy, getDocs, getDoc, doc, setDoc, updateDoc } from './firebase/firebase-firestore.js';
 
 document.addEventListener("DOMContentLoaded", () => {
   // Notify background script that extension page is available
   chrome.runtime.sendMessage({ type: "EXTENSION_PAGE_CONNECTED" });
 
-  // Add message listener for transcript queue processing
+  // Add message listener for transcript processing
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === "PROCESS_TRANSCRIPT_QUEUE") {
-      // Process queued transcripts
+    // Handle new single-document transcript operations
+    if (message.type === "INIT_TRANSCRIPT_DOC") {
+      initializeTranscriptDocument(message.uid, message.meetingId, message.docId, message.startTime, message.status);
+      sendResponse({success: true});
+    } else if (message.type === "UPDATE_TRANSCRIPT_DOC") {
+      updateTranscriptDocument(message.uid, message.meetingId, message.docId, message.transcript, message.lastUpdated, message.status);
+      sendResponse({success: true});
+    } else if (message.type === "FINALIZE_TRANSCRIPT_DOC") {
+      finalizeTranscriptDocument(message.uid, message.meetingId, message.docId, message.transcript, message.endTime, message.wordCount, message.status);
+      sendResponse({success: true});
+    }
+    // Handle legacy transcript operations for backward compatibility
+    else if (message.type === "PROCESS_TRANSCRIPT_QUEUE") {
+      // Process queued transcripts (legacy)
       processQueuedTranscripts(message.queue);
       sendResponse({success: true});
     } else if (message.type === "SAVE_TRANSCRIPT_REQUEST") {
-      // Handle direct transcript saving request
+      // Handle direct transcript saving request (legacy)
       saveTranscriptToFirebase(message.uid, message.meetingId, message.transcript);
       sendResponse({success: true});
     }
-    // ... other existing message handlers
+    // Handle other message types
     else if (message.type === "SPEECH_RESULT") {
       chatInput.value = message.transcript;
       chatInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
@@ -50,11 +62,84 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Function to process queued transcripts
+  // Function to initialize a new transcript document
+  async function initializeTranscriptDocument(uid, meetingId, docId, startTime, status) {
+    try {
+      const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+      await setDoc(transcriptDocRef, {
+        transcript: "",
+        startTime: startTime,
+        lastUpdated: startTime,
+        status: status,
+        wordCount: 0,
+        createdAt: serverTimestamp()
+      });
+      console.log(`Initialized transcript document: ${docId}`);
+    } catch (error) {
+      console.error("Error initializing transcript document:", error);
+      // Fallback to chrome.storage
+      await storeTranscriptInStorage(uid, meetingId, docId, {
+        transcript: "",
+        startTime: startTime,
+        status: status
+      });
+    }
+  }
+
+  // Function to update transcript document in real-time
+  async function updateTranscriptDocument(uid, meetingId, docId, transcript, lastUpdated, status) {
+    try {
+      const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+      
+      // Use setDoc with merge: true to ensure document exists
+      await setDoc(transcriptDocRef, {
+        transcript: transcript,
+        lastUpdated: lastUpdated,
+        status: status,
+        wordCount: transcript.trim().split(/\s+/).filter(word => word.length > 0).length
+      }, { merge: true });
+      
+      console.log(`Updated transcript document: ${docId} (${transcript.length} chars)`);
+    } catch (error) {
+      console.error("Error updating transcript document:", error);
+      // Fallback to chrome.storage
+      await storeTranscriptInStorage(uid, meetingId, docId, {
+        transcript: transcript,
+        lastUpdated: lastUpdated,
+        status: status
+      });
+    }
+  }
+
+  // Function to finalize transcript document
+  async function finalizeTranscriptDocument(uid, meetingId, docId, transcript, endTime, wordCount, status) {
+    try {
+      const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+      
+      // Use setDoc with merge: true instead of updateDoc to ensure document exists
+      await setDoc(transcriptDocRef, {
+        transcript: transcript,
+        endTime: endTime,
+        status: status,
+        wordCount: wordCount,
+        finalizedAt: serverTimestamp()
+      }, { merge: true });
+      
+      console.log(`Finalized transcript document: ${docId} (${wordCount} words)`);
+    } catch (error) {
+      console.error("Error finalizing transcript document:", error);
+      // Fallback to chrome.storage
+      await storeTranscriptInStorage(uid, meetingId, docId, {
+        transcript: transcript,
+        endTime: endTime,
+        status: status,
+        wordCount: wordCount
+      });
+    }
+  }
+
+  // Function to process queued transcripts (legacy support)
   async function processQueuedTranscripts(queue) {
-    const { db } = await import('./firebase-config.js');
-    const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
-    
     for (const item of queue) {
       try {
         const transcriptDocRef = doc(collection(db, "users", item.uid, "meetings", item.meetingId, "transcripts"));
@@ -79,23 +164,45 @@ document.addEventListener("DOMContentLoaded", () => {
       const transcriptKeys = Object.keys(allData).filter(key => key.startsWith('transcript_'));
       
       if (transcriptKeys.length > 0) {
-        const { db } = await import('./firebase-config.js');
-        const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
-        
         for (const key of transcriptKeys) {
-          const [, uid, meetingId] = key.split('_');
-          const transcript = allData[key];
-          
-          if (transcript && transcript.trim()) {
-            const transcriptDocRef = doc(collection(db, uid, "meetings", meetingId, "transcripts"));
-            await setDoc(transcriptDocRef, { 
-              content: transcript, 
-              timestamp: serverTimestamp() 
-            }, { merge: true });
+          const parts = key.split('_');
+          if (parts.length >= 4) {
+            // New format: transcript_uid_meetingId_docId
+            const [, uid, meetingId, docId] = parts;
+            const data = allData[key];
             
-            // Remove from storage after successful save
-            await chrome.storage.local.remove(key);
-            console.log(`Processed stored transcript for meeting ${meetingId}`);
+            if (data && typeof data === 'object') {
+              const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+              await setDoc(transcriptDocRef, {
+                transcript: data.transcript || "",
+                startTime: data.startTime,
+                endTime: data.endTime,
+                lastUpdated: data.lastUpdated,
+                status: data.status || 'completed',
+                wordCount: data.wordCount || 0,
+                createdAt: serverTimestamp()
+              });
+              
+              // Remove from storage after successful save
+              await chrome.storage.local.remove(key);
+              console.log(`Processed stored transcript: ${docId}`);
+            }
+          } else if (parts.length === 3) {
+            // Legacy format: transcript_uid_meetingId
+            const [, uid, meetingId] = parts;
+            const transcript = allData[key];
+            
+            if (transcript && transcript.trim()) {
+              const transcriptDocRef = doc(collection(db, "users", uid, "meetings", meetingId, "transcripts"));
+              await setDoc(transcriptDocRef, { 
+                content: transcript, 
+                timestamp: serverTimestamp() 
+              });
+              
+              // Remove from storage after successful save
+              await chrome.storage.local.remove(key);
+              console.log(`Processed legacy stored transcript for meeting ${meetingId}`);
+            }
           }
         }
       }
@@ -104,12 +211,22 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // Function to save transcript to Firebase (for direct requests)
+  // Fallback storage function
+  async function storeTranscriptInStorage(uid, meetingId, docId, data) {
+    try {
+      const storageKey = `transcript_${uid}_${meetingId}_${docId}`;
+      await chrome.storage.local.set({
+        [storageKey]: data
+      });
+      console.log("Transcript stored in chrome.storage as backup:", storageKey);
+    } catch (error) {
+      console.error("Failed to store transcript in storage:", error);
+    }
+  }
+
+  // Function to save transcript to Firebase (for direct requests - legacy)
   async function saveTranscriptToFirebase(uid, meetingId, transcript) {
     try {
-      const { db } = await import('./firebase-config.js');
-      const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
-      
       const transcriptDocRef = doc(collection(db, "users", uid, "meetings", meetingId, "transcripts"));
       await setDoc(transcriptDocRef, { 
         content: transcript, 
@@ -121,6 +238,31 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  // Function to load transcript (updated to handle new format)
+  async function loadTranscript(uid, meetingId) {
+    try {
+      const transcriptsRef = collection(db, "users", uid, "meetings", meetingId, "transcripts");
+      const snapshot = await getDocs(transcriptsRef);
+      let transcriptContent = "";
+      
+      snapshot.forEach(doc => {
+        const data = doc.data();
+        // Handle both new format (transcript field) and legacy format (content field)
+        if (data.transcript) {
+          transcriptContent += data.transcript + "\n";
+        } else if (data.content) {
+          transcriptContent += data.content + "\n";
+        }
+      });
+      
+      return transcriptContent.trim();
+    } catch (error) {
+      console.error("Error loading transcript:", error);
+      return "Failed to load meeting transcript.";
+    }
+  }
+
+  // Rest of the chat.js code remains the same...
   import('./ai-helper.js').then(({ getAIResponse }) => {
     const chatMessages = document.getElementById("chatMessages");
     const chatInput = document.getElementById("chatInput");
@@ -352,19 +494,6 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
 
-    async function loadTranscript(uid, meetingId) {
-      const transcriptRef = collection(db, "users", uid, "meetings", meetingId, "transcripts");
-      const snapshot = await getDocs(transcriptRef);
-      let transcriptContent = "";
-      snapshot.forEach(doc => {
-        const data = doc.data();
-        if (data.content) {
-          transcriptContent += data.content + "\n";
-        }
-      });
-      return transcriptContent.trim();
-    }
-
     chrome.storage.local.get(["selectedMeetingForChat", "uid"], async (result) => {
       if (result.selectedMeetingForChat && result.uid) {
         selectedMeeting = result.selectedMeetingForChat;
@@ -480,7 +609,7 @@ document.addEventListener("DOMContentLoaded", () => {
               }
             }
           } else if (/find|search|look.*for/i.test(input)) {
-            const keyword = input.match(/["“](.*?)["”]/)?.[1] || input.replace(/.*\b(find|search|look.*for)\b/i, '').trim();
+            const keyword = input.match(/[""](.*?)[""]/)?.[1] || input.replace(/.*\b(find|search|look.*for)\b/i, '').trim();
             const folderId = extractFolderId(selectedMeeting.driveFolderLink);
             if (!folderId) {
               aiBubble.innerHTML = "⚠️ Could not extract Drive folder ID.";

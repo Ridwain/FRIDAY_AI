@@ -9,18 +9,122 @@ chrome.storage.local.get(["email", "uid"], (result) => {
 
 // Add message listener for transcript processing
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === "PROCESS_TRANSCRIPT_QUEUE") {
-    // Process queued transcripts
+  // Handle new single-document transcript operations
+  if (message.type === "INIT_TRANSCRIPT_DOC") {
+    initializeTranscriptDocument(message.uid, message.meetingId, message.docId, message.startTime, message.status);
+    sendResponse({success: true});
+  } else if (message.type === "UPDATE_TRANSCRIPT_DOC") {
+    updateTranscriptDocument(message.uid, message.meetingId, message.docId, message.transcript, message.lastUpdated, message.status);
+    sendResponse({success: true});
+  } else if (message.type === "FINALIZE_TRANSCRIPT_DOC") {
+    finalizeTranscriptDocument(message.uid, message.meetingId, message.docId, message.transcript, message.endTime, message.wordCount, message.status);
+    sendResponse({success: true});
+  }
+  // Handle legacy transcript operations for backward compatibility
+  else if (message.type === "PROCESS_TRANSCRIPT_QUEUE") {
+    // Process queued transcripts (legacy)
     processQueuedTranscripts(message.queue);
     sendResponse({success: true});
   } else if (message.type === "SAVE_TRANSCRIPT_REQUEST") {
-    // Handle direct transcript saving request
+    // Handle direct transcript saving request (legacy)
     saveTranscriptToFirebase(message.uid, message.meetingId, message.transcript);
     sendResponse({success: true});
   }
 });
 
-// Function to process queued transcripts
+// Function to initialize a new transcript document
+async function initializeTranscriptDocument(uid, meetingId, docId, startTime, status) {
+  try {
+    const { db } = await import('./firebase-config.js');
+    const { doc, setDoc, serverTimestamp } = await import('./firebase/firebase-firestore.js');
+    
+    const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+    await setDoc(transcriptDocRef, {
+      transcript: "",
+      startTime: startTime,
+      lastUpdated: startTime,
+      status: status,
+      wordCount: 0,
+      createdAt: serverTimestamp()
+    });
+    console.log(`Initialized transcript document: ${docId}`);
+  } catch (error) {
+    console.error("Error initializing transcript document:", error);
+    // Fallback to chrome.storage
+    await storeTranscriptInStorage(uid, meetingId, docId, {
+      transcript: "",
+      startTime: startTime,
+      status: status
+    });
+  }
+}
+
+// Function to update transcript document in real-time
+async function updateTranscriptDocument(uid, meetingId, docId, transcript, lastUpdated, status) {
+  try {
+    const { db } = await import('./firebase-config.js');
+    const { doc, updateDoc } = await import('./firebase/firebase-firestore.js');
+    
+    const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+    await updateDoc(transcriptDocRef, {
+      transcript: transcript,
+      lastUpdated: lastUpdated,
+      status: status,
+      wordCount: transcript.trim().split(/\s+/).filter(word => word.length > 0).length
+    });
+    console.log(`Updated transcript document: ${docId} (${transcript.length} chars)`);
+  } catch (error) {
+    console.error("Error updating transcript document:", error);
+    // Fallback to chrome.storage
+    await storeTranscriptInStorage(uid, meetingId, docId, {
+      transcript: transcript,
+      lastUpdated: lastUpdated,
+      status: status
+    });
+  }
+}
+
+// Function to finalize transcript document
+async function finalizeTranscriptDocument(uid, meetingId, docId, transcript, endTime, wordCount, status) {
+  try {
+    const { db } = await import('./firebase-config.js');
+    const { doc, updateDoc, serverTimestamp } = await import('./firebase/firebase-firestore.js');
+    
+    const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+    await updateDoc(transcriptDocRef, {
+      transcript: transcript,
+      endTime: endTime,
+      status: status,
+      wordCount: wordCount,
+      finalizedAt: serverTimestamp()
+    });
+    console.log(`Finalized transcript document: ${docId} (${wordCount} words)`);
+  } catch (error) {
+    console.error("Error finalizing transcript document:", error);
+    // Fallback to chrome.storage
+    await storeTranscriptInStorage(uid, meetingId, docId, {
+      transcript: transcript,
+      endTime: endTime,
+      status: status,
+      wordCount: wordCount
+    });
+  }
+}
+
+// Fallback storage function
+async function storeTranscriptInStorage(uid, meetingId, docId, data) {
+  try {
+    const storageKey = `transcript_${uid}_${meetingId}_${docId}`;
+    await chrome.storage.local.set({
+      [storageKey]: data
+    });
+    console.log("Transcript stored in chrome.storage as backup:", storageKey);
+  } catch (error) {
+    console.error("Failed to store transcript in storage:", error);
+  }
+}
+
+// Function to process queued transcripts (legacy support)
 async function processQueuedTranscripts(queue) {
   const { db } = await import('./firebase-config.js');
   const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
@@ -53,19 +157,44 @@ async function processStoredTranscripts() {
       const { doc, setDoc, collection, serverTimestamp } = await import('./firebase/firebase-firestore.js');
       
       for (const key of transcriptKeys) {
-        const [, uid, meetingId] = key.split('_');
-        const transcript = allData[key];
-        
-        if (transcript && transcript.trim()) {
-          const transcriptDocRef = doc(collection(db, "users", uid, "meetings", meetingId, "transcripts"));
-          await setDoc(transcriptDocRef, { 
-            content: transcript, 
-            timestamp: serverTimestamp() 
-          }, { merge: true });
+        const parts = key.split('_');
+        if (parts.length >= 4) {
+          // New format: transcript_uid_meetingId_docId
+          const [, uid, meetingId, docId] = parts;
+          const data = allData[key];
           
-          // Remove from storage after successful save
-          await chrome.storage.local.remove(key);
-          console.log(`Processed stored transcript for meeting ${meetingId}`);
+          if (data && typeof data === 'object') {
+            const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
+            await setDoc(transcriptDocRef, {
+              transcript: data.transcript || "",
+              startTime: data.startTime,
+              endTime: data.endTime,
+              lastUpdated: data.lastUpdated,
+              status: data.status || 'completed',
+              wordCount: data.wordCount || 0,
+              createdAt: serverTimestamp()
+            });
+            
+            // Remove from storage after successful save
+            await chrome.storage.local.remove(key);
+            console.log(`Processed stored transcript: ${docId}`);
+          }
+        } else if (parts.length === 3) {
+          // Legacy format: transcript_uid_meetingId
+          const [, uid, meetingId] = parts;
+          const transcript = allData[key];
+          
+          if (transcript && transcript.trim()) {
+            const transcriptDocRef = doc(collection(db, "users", uid, "meetings", meetingId, "transcripts"));
+            await setDoc(transcriptDocRef, { 
+              content: transcript, 
+              timestamp: serverTimestamp() 
+            });
+            
+            // Remove from storage after successful save
+            await chrome.storage.local.remove(key);
+            console.log(`Processed legacy stored transcript for meeting ${meetingId}`);
+          }
         }
       }
     }
@@ -74,7 +203,7 @@ async function processStoredTranscripts() {
   }
 }
 
-// Function to save transcript to Firebase (for direct requests)
+// Function to save transcript to Firebase (for direct requests - legacy)
 async function saveTranscriptToFirebase(uid, meetingId, transcript) {
   try {
     const { db } = await import('./firebase-config.js');

@@ -5,7 +5,9 @@
     isActive: false,
     accumulatedTranscript: "",
     meetingId: null,
-    uid: null
+    uid: null,
+    lastSaveTime: 0,
+    saveInterval: 2000 // Save every 2 seconds during active transcription
   };
 
   // Listen for messages from background script
@@ -37,6 +39,7 @@
     transcriptionState.meetingId = meetingId;
     transcriptionState.uid = uid;
     transcriptionState.accumulatedTranscript = "";
+    transcriptionState.lastSaveTime = 0;
     transcriptionState.recognition = new SpeechRecognition();
 
     const recognition = transcriptionState.recognition;
@@ -47,6 +50,9 @@
     recognition.onstart = () => {
       transcriptionState.isActive = true;
       console.log("Speech recognition started");
+      
+      // Initialize the transcript document
+      initializeTranscriptDocument();
       
       // Add visual indicator to the page
       addTranscriptionIndicator();
@@ -60,17 +66,17 @@
         const transcript = event.results[i][0].transcript;
         if (event.results[i].isFinal) {
           finalTranscript += transcript + " ";
-          transcriptionState.accumulatedTranscript += transcript + " ";
-          
-          // Send final transcript to background script
-          chrome.runtime.sendMessage({
-            type: "TRANSCRIPTION_RESULT",
-            transcript: transcriptionState.accumulatedTranscript,
-            isFinal: true
-          });
         } else {
           interimTranscript += transcript;
         }
+      }
+
+      // Update accumulated transcript with final results
+      if (finalTranscript) {
+        transcriptionState.accumulatedTranscript += finalTranscript;
+        
+        // Save immediately when we have final transcript
+        saveTranscriptRealtime();
       }
 
       // Update visual indicator with current transcript
@@ -154,10 +160,58 @@
       transcriptionState.recognition = null;
     }
 
+    // Final save before stopping
+    if (transcriptionState.accumulatedTranscript.trim()) {
+      finalizeTranscriptDocument();
+    }
+
     // Remove visual indicator
     removeTranscriptionIndicator();
 
     console.log("Transcription stopped");
+  }
+
+  function initializeTranscriptDocument() {
+    // Initialize the transcript document with metadata
+    chrome.runtime.sendMessage({
+      type: "INITIALIZE_TRANSCRIPT",
+      uid: transcriptionState.uid,
+      meetingId: transcriptionState.meetingId,
+      startTime: new Date().toISOString()
+    });
+  }
+
+  function saveTranscriptRealtime() {
+    const now = Date.now();
+    
+    // Throttle saves to avoid too frequent updates
+    if (now - transcriptionState.lastSaveTime < transcriptionState.saveInterval) {
+      return;
+    }
+    
+    transcriptionState.lastSaveTime = now;
+
+    if (transcriptionState.accumulatedTranscript.trim()) {
+      chrome.runtime.sendMessage({
+        type: "UPDATE_TRANSCRIPT_REALTIME",
+        uid: transcriptionState.uid,
+        meetingId: transcriptionState.meetingId,
+        transcript: transcriptionState.accumulatedTranscript,
+        lastUpdated: new Date().toISOString()
+      });
+    }
+  }
+
+  function finalizeTranscriptDocument() {
+    // Final save with completion status
+    chrome.runtime.sendMessage({
+      type: "FINALIZE_TRANSCRIPT",
+      uid: transcriptionState.uid,
+      meetingId: transcriptionState.meetingId,
+      transcript: transcriptionState.accumulatedTranscript,
+      endTime: new Date().toISOString(),
+      wordCount: transcriptionState.accumulatedTranscript.trim().split(/\s+/).length
+    });
   }
 
   function addTranscriptionIndicator() {
@@ -211,4 +265,4 @@
     type: "CONTENT_SCRIPT_READY"
   });
 
-})();
+})()
