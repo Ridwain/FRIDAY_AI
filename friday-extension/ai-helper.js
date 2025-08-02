@@ -9,7 +9,7 @@ export async function getAIResponse(messages) {
       model: "llama3-8b-8192",
       messages: messages
     })
-  });
+  });  
 
   const data = await response.json();
   return data.choices?.[0]?.message?.content?.trim() || "⚠️ No reply from AI.";
