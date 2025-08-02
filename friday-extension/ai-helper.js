@@ -7,7 +7,7 @@ const ENHANCED_PROVIDERS = {
   GROQ: {
     name: 'Groq',
     url: 'https://api.groq.com/openai/v1/chat/completions',
-    key: '',
+    key: '', //apply your key here
     models: {
       ultraFast: 'llama-3.1-8b-instant',  // NEW: Even faster!
       fast: 'llama3-8b-8192',
