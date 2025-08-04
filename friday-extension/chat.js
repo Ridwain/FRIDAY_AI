@@ -1,6 +1,9 @@
 import { db } from './firebase-config.js';
 import { collection, addDoc, serverTimestamp, query, orderBy, getDocs, getDoc, doc, setDoc, updateDoc } from './firebase/firebase-firestore.js';
 
+function normalizeFilename(name) {
+  return name.trim().toLowerCase();
+}
 
 document.addEventListener("DOMContentLoaded", () => {
   // Notify background script that extension page is available
@@ -400,14 +403,29 @@ document.addEventListener("DOMContentLoaded", () => {
       
       // Specific file content queries  
       file_content: [
-        /\bwhat.*is.*inside.*\.(txt|doc|pdf|md|csv)/i,
+        // Mention of specific file types or extensions
+        /\b(?:_?[A-Za-z0-9\s-]+\.docx?)\b/i,                         // e.g., Proposal.docx
+        /\b(?:_?[A-Za-z0-9\s-]+\.txt|\.csv|\.md|\.pdf)\b/i,
+
+        // General "read file" or "open file"
         /\bread.*file/i,
-        /\bcontent.*of.*file/i,
         /\bopen.*file/i,
-        /\bfile.*contains?/i,
-        /\bin.*file.*\w+\.\w+/i
+        /\bshow.*file/i,
+        /\bextract.*from.*file/i,
+
+        // Asking about content
+        /\bwhat.*(?:inside|in|from).*file/i,
+        /\bfile.*contains?\b/i,
+        /\bcontents? of\b.*file/i,
+        /\bdata.*in.*file/i,
+        /\binfo.*from.*file/i,
+
+        // Specific questions like your case
+        /\bwhat.*project.*(?:discussed|in).*file/i,
+        /\bname.*of.*project.*in.*file/i,
+        /\b(?:title|name).*in.*(?:_?[A-Za-z0-9\s-]+\.docx?)\b/i
       ],
-      
+
       // Meeting transcript queries
       meeting_transcript: [
         /\b(what.*did|who.*said|when.*did|how.*did|why.*did)\b/i,
@@ -1014,41 +1032,115 @@ MEETING DETAILS (reference only when specifically asked):
     if (!res.ok) throw new Error('Failed to download text file: ' + res.status);
     return await res.text();
   }
+  function loadMammothIfNeeded() {
+    return new Promise((resolve, reject) => {
+      if (window.mammoth) return resolve(window.mammoth);
 
+      const script = document.createElement("script");
+      script.src = chrome.runtime.getURL("libs/mammoth.browser.min.js");
+      script.onload = () => resolve(window.mammoth);
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  }
+  // Load pdf.js and pdf.worker.js if not already loaded
+  function loadPdfJSIfNeeded() {
+    return new Promise((resolve, reject) => {
+      if (window.pdfjsLib) return resolve(window.pdfjsLib);
+
+      const script = document.createElement("script");
+      script.src = chrome.runtime.getURL("libs/pdf.js");
+
+      script.onload = () => {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+          chrome.runtime.getURL("libs/pdf.worker.js");
+        resolve(window.pdfjsLib);
+      };
+
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  }
   // Function to download and process different file types
   async function downloadFileContent(file, token) {
-    try {
-      let content = "";
-      
-      switch (file.mimeType) {
-        case 'application/vnd.google-apps.document':
-          content = await downloadGoogleDocAsText(file.id, token);
-          break;
-        case 'text/plain':
-        case 'text/csv':
-        case 'text/markdown':
-          content = await downloadPlainTextFile(file.id, token);
-          break;
-        case 'application/vnd.google-apps.spreadsheet':
-          // Export as CSV for spreadsheets
-          const csvRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/csv`, {
-            headers: { Authorization: `Bearer ${token}` }
-          });
-          if (csvRes.ok) {
-            content = await csvRes.text();
-          }
-          break;
-        default:
-          console.log(`Unsupported file type: ${file.mimeType} for file: ${file.name}`);
-          return null;
+  try {
+    let content = "";
+
+    switch (file.mimeType) {
+      case 'application/vnd.google-apps.document':
+        content = await downloadGoogleDocAsText(file.id, token);
+        break;
+
+      case 'text/plain':
+      case 'text/csv':
+      case 'text/markdown':
+        content = await downloadPlainTextFile(file.id, token);
+        break;
+
+      case 'application/vnd.google-apps.spreadsheet':
+        const csvRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/csv`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (csvRes.ok) {
+          content = await csvRes.text();
+        }
+        break;
+
+      case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
+        const blobRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        if (!blobRes.ok) throw new Error(`Failed to download DOCX file: ${blobRes.status}`);
+        const blob = await blobRes.blob();
+        const arrayBuffer = await blob.arrayBuffer();
+
+        await loadMammothIfNeeded();
+        const { convertToHtml } = window.mammoth;
+
+        const result = await convertToHtml({ arrayBuffer });
+        content = result.value.replace(/<[^>]+>/g, ''); // Strip HTML tags to get plain text
+        break;
       }
-      
-      return content;
-    } catch (error) {
-      console.error(`Error downloading file ${file.name}:`, error);
-      return null;
+
+      case 'application/pdf': {
+        const res = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        if (!res.ok) throw new Error(`Failed to download PDF file: ${res.status}`);
+        const blob = await res.blob();
+        const arrayBuffer = await blob.arrayBuffer();
+
+        await loadPdfJSIfNeeded(); // Load the pdf.js script
+
+        const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+        let text = "";
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const pageContent = await page.getTextContent();
+          const pageText = pageContent.items.map(item => item.str).join(" ");
+          text += pageText + "\n\n";
+        }
+
+        content = text;
+        break;
+      }
+
+      default:
+        console.log(`Unsupported file type: ${file.mimeType} for file: ${file.name}`);
+        return null;
     }
+
+    return content;
+  } catch (error) {
+    console.error(`Error downloading file ${file.name}:`, error);
+    return null;
   }
+}
+
+
 
   // Enhanced search function with better filtering
   async function searchFilesRecursively(folderId, queryText, token) {
@@ -1312,17 +1404,20 @@ MEETING DETAILS (reference only when specifically asked):
         const supportedFiles = files.filter(f =>
           f.mimeType === "text/plain" ||
           f.mimeType === "application/vnd.google-apps.document" ||
+          f.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || // <-- Add this
+          f.mimeType === "application/pdf" ||
           f.mimeType === "text/csv" ||
           f.mimeType === "text/markdown" ||
           f.mimeType === "application/vnd.google-apps.spreadsheet"
         );
+
 
         console.log(`📁 Found ${supportedFiles.length} supported files out of ${files.length} total files`);
 
         // Load content for smaller files (under 1MB)
         let loadedCount = 0;
         for (const file of supportedFiles.slice(0, 10)) { // Limit to first 10 files
-          if (!file.size || parseInt(file.size) < 1000000) { // 1MB limit
+          if (!file.size || parseInt(file.size) < 5000000) { // 5MB limit
             try {
               const content = await downloadFileContent(file, token);
               if (content) {

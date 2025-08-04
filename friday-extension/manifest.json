@@ -37,15 +37,25 @@
   },
   "oauth2": {
     "client_id": "837567341884-crat3qdlnqf60gbe5cgjlludjeti81r4.apps.googleusercontent.com",
-    "scopes": ["profile", "email", "https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/userinfo.email"]
+    "scopes": [
+      "profile",
+      "email",
+      "https://www.googleapis.com/auth/drive.readonly",
+      "https://www.googleapis.com/auth/userinfo.email"
+    ]
   },
   "icons": {
     "16": "friday.png"
   },
   "web_accessible_resources": [
     {
-      "resources": ["transcription-content.js"],
-      "matches": ["https://meet.google.com/*"]
+      "resources": [
+        "transcription-content.js",
+        "libs/mammoth.browser.min.js",
+        "libs/pdf.js",
+        "libs/pdf.worker.js"
+      ],
+      "matches": ["<all_urls>"]
     }
   ]
 }
