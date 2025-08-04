@@ -389,7 +389,8 @@ document.addEventListener("DOMContentLoaded", () => {
   // ENHANCED QUESTION ROUTING - This is the key improvement
   function analyzeQuestionIntent(query) {
     const queryLower = query.toLowerCase();
-    
+    if (/\.(pptx|docx?|pdf|txt|csv|md)$/i.test(queryLower)) return 'file_content';
+
     const patterns = {
       // Drive file operations
       drive_files: [
@@ -403,9 +404,8 @@ document.addEventListener("DOMContentLoaded", () => {
       
       // Specific file content queries  
       file_content: [
-        // Mention of specific file types or extensions
-        /\b(?:_?[A-Za-z0-9\s-]+\.docx?)\b/i,                         // e.g., Proposal.docx
-        /\b(?:_?[A-Za-z0-9\s-]+\.txt|\.csv|\.md|\.pdf)\b/i,
+        /\b(?:_?[A-Za-z0-9\s-]+\.docx?)\b/i,
+        /\b(?:_?[A-Za-z0-9\s-]+\.txt|\.csv|\.md|\.pdf|\.pptx)\b/i,
 
         // General "read file" or "open file"
         /\bread.*file/i,
@@ -1043,6 +1043,19 @@ MEETING DETAILS (reference only when specifically asked):
       document.head.appendChild(script);
     });
   }
+
+  function loadPptxParserIfNeeded() {
+    return new Promise((resolve, reject) => {
+      if (window.pptxToText) return resolve(window.pptxToText);
+
+      const script = document.createElement("script");
+      script.src = chrome.runtime.getURL("libs/pptx-parser.js");
+      script.onload = () => resolve(window.pptxToText);
+      script.onerror = reject;
+      document.head.appendChild(script);
+    });
+  }
+
   // Load pdf.js and pdf.worker.js if not already loaded
   function loadPdfJSIfNeeded() {
     return new Promise((resolve, reject) => {
@@ -1077,7 +1090,7 @@ MEETING DETAILS (reference only when specifically asked):
         content = await downloadPlainTextFile(file.id, token);
         break;
 
-      case 'application/vnd.google-apps.spreadsheet':
+      case 'application/vnd.google-apps.spreadsheet': {
         const csvRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/csv`, {
           headers: { Authorization: `Bearer ${token}` }
         });
@@ -1085,6 +1098,7 @@ MEETING DETAILS (reference only when specifically asked):
           content = await csvRes.text();
         }
         break;
+      }
 
       case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
         const blobRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
@@ -1099,7 +1113,22 @@ MEETING DETAILS (reference only when specifically asked):
         const { convertToHtml } = window.mammoth;
 
         const result = await convertToHtml({ arrayBuffer });
-        content = result.value.replace(/<[^>]+>/g, ''); // Strip HTML tags to get plain text
+        content = result.value.replace(/<[^>]+>/g, ''); // Strip HTML tags
+        break;
+      }
+
+      case 'application/vnd.openxmlformats-officedocument.presentationml.presentation': {
+        const blobRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        if (!blobRes.ok) throw new Error(`Failed to download PPTX file: ${blobRes.status}`);
+        const blob = await blobRes.blob();
+        const arrayBuffer = await blob.arrayBuffer();
+
+        await loadPptxParserIfNeeded(); // <-- New helper function
+        const text = await window.pptxToText(arrayBuffer);
+        content = text;
         break;
       }
 
@@ -1112,7 +1141,7 @@ MEETING DETAILS (reference only when specifically asked):
         const blob = await res.blob();
         const arrayBuffer = await blob.arrayBuffer();
 
-        await loadPdfJSIfNeeded(); // Load the pdf.js script
+        await loadPdfJSIfNeeded();
 
         const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
@@ -1139,6 +1168,7 @@ MEETING DETAILS (reference only when specifically asked):
     return null;
   }
 }
+
 
 
 
@@ -1384,6 +1414,7 @@ MEETING DETAILS (reference only when specifically asked):
     });
 
     // Function to preload Drive files
+    // Function to preload Drive files - FIXED VERSION
     async function preloadDriveFiles() {
       if (!selectedMeeting?.driveFolderLink) {
         console.log("No Drive folder link available");
@@ -1404,35 +1435,49 @@ MEETING DETAILS (reference only when specifically asked):
         const supportedFiles = files.filter(f =>
           f.mimeType === "text/plain" ||
           f.mimeType === "application/vnd.google-apps.document" ||
-          f.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || // <-- Add this
+          f.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
           f.mimeType === "application/pdf" ||
           f.mimeType === "text/csv" ||
           f.mimeType === "text/markdown" ||
-          f.mimeType === "application/vnd.google-apps.spreadsheet"
+          f.mimeType === "application/vnd.google-apps.spreadsheet"|| 
+          f.mimeType === "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         );
-
 
         console.log(`📁 Found ${supportedFiles.length} supported files out of ${files.length} total files`);
 
-        // Load content for smaller files (under 1MB)
+        // Load content for smaller files (under 5MB)
         let loadedCount = 0;
-        for (const file of supportedFiles.slice(0, 10)) { // Limit to first 10 files
-          if (!file.size || parseInt(file.size) < 5000000) { // 5MB limit
-            try {
-              const content = await downloadFileContent(file, token);
-              if (content) {
-                const fileKey = file.name.toLowerCase();
-                filesContentMap[fileKey] = content;
-                console.log(`📄 Loaded: ${file.name} (${content.length} chars)`);
-                loadedCount++;
-              }
-            } catch (error) {
-              console.warn(`Failed to load file ${file.name}:`, error);
+        const maxFilesToLoad = 10;
+        
+        for (const file of supportedFiles.slice(0, maxFilesToLoad)) {
+          console.log("🧪 Preloading:", file.name, file.mimeType, file.size);
+
+          // Skip files larger than 5MB or if size is undefined (treat undefined as small)
+          if (file.size && parseInt(file.size) >= 5000000) {
+            console.log(`⛔ Skipped (too large): ${file.name} (${file.size} bytes)`);
+            continue;
+          }
+
+          try {
+            const content = await downloadFileContent(file, token);
+
+            if (content && content.trim().length > 0) {
+              const fileKey = file.name.toLowerCase();
+              filesContentMap[fileKey] = content;
+              loadedCount++; // INCREMENT COUNTER HERE - AFTER SUCCESSFUL LOAD
+              console.log(`📄 Loaded: ${file.name} (${content.length} chars)`);
+            } else {
+              console.warn(`⚠️ No content extracted from: ${file.name}`);
             }
+
+          } catch (error) {
+            console.warn(`❌ Failed to load file ${file.name}:`, error);
           }
         }
 
         console.log(`✅ Preloaded ${loadedCount} files successfully`);
+        console.log(`📝 Files in memory:`, Object.keys(filesContentMap));
+        
       } catch (error) {
         console.warn("⚠️ Failed to preload Drive files:", error);
       }
