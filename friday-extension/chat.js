@@ -467,6 +467,19 @@ document.addEventListener("DOMContentLoaded", () => {
     return 'general';
   }
 
+  function detectExplicitFileOrTranscriptMention(query) {
+    const lower = query.toLowerCase();
+
+    const mentionsSpecificFile = /\b[\w\s-]+\.(docx?|pdf|txt|csv|md|pptx)\b/i.test(lower);
+    const mentionsTranscriptOnly = /\b(transcript|meeting|conversation|call|session)\b/i.test(lower);
+
+    return {
+      mentionsSpecificFile,
+      mentionsTranscriptOnly
+    };
+  }
+
+
   // Enhanced function to determine if query needs transcript search
   function needsTranscriptSearch(query) {
     const intent = analyzeQuestionIntent(query);
@@ -593,8 +606,13 @@ document.addEventListener("DOMContentLoaded", () => {
   async function getEnhancedAIResponse(input, selectedMeeting, userUid, filesContentMap, getAIResponse) {
     const questionIntent = analyzeQuestionIntent(input);
     const questionCategory = categorizeQuestion(input);
-    const needsTranscriptLookup = needsTranscriptSearch(input);
-    const needsFileAccess = needsDriveAccess(input);
+
+    const { mentionsSpecificFile, mentionsTranscriptOnly } = detectExplicitFileOrTranscriptMention(input);
+
+    // Default behavior: check both, unless explicitly limited
+    const needsTranscriptLookup = mentionsTranscriptOnly || (!mentionsSpecificFile && !mentionsTranscriptOnly);
+    const needsFileAccess = mentionsSpecificFile || (!mentionsSpecificFile && !mentionsTranscriptOnly);
+
     
     console.log(`🤖 AI Analysis: Intent="${questionIntent}", Category="${questionCategory}"`);
     
