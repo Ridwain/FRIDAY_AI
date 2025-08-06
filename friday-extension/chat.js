@@ -1,6 +1,21 @@
 import { db } from './firebase-config.js';
 import { collection, addDoc, serverTimestamp, query, orderBy, getDocs, getDoc, doc, setDoc, updateDoc } from './firebase/firebase-firestore.js';
 
+// SEMANTIC SEARCH CONFIGURATION
+const EMBEDDING_CONFIG = {
+  OPENAI_API_KEY: 'your-openai-api-key-here', // Replace with your OpenAI API key
+  EMBEDDING_MODEL: 'text-embedding-ada-002',
+  EMBEDDING_DIMENSIONS: 1536,
+  SIMILARITY_THRESHOLD: 0.7,
+  MAX_DOCUMENTS_FOR_CONTEXT: 5,
+  CHUNK_SIZE: 1000, // Characters per chunk for large documents
+  CHUNK_OVERLAP: 200 // Overlap between chunks
+};
+
+// In-memory storage for embeddings cache
+const embeddingsCache = new Map();
+const documentChunksCache = new Map();
+
 function normalizeFilename(name) {
   return name.trim().toLowerCase();
 }
@@ -268,6 +283,361 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  // SEMANTIC SEARCH IMPLEMENTATION
+
+  /**
+   * Generate embeddings using OpenAI API
+   * @param {string} text - Text to generate embeddings for
+   * @returns {Promise<number[]>} - Array of embedding values
+   */
+  async function generateEmbedding(text) {
+    try {
+      const response = await fetch('https://api.openai.com/v1/embeddings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${EMBEDDING_CONFIG.OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+          input: text.substring(0, 8000), // OpenAI has token limits
+          model: EMBEDDING_CONFIG.EMBEDDING_MODEL
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`OpenAI API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data.data[0].embedding;
+    } catch (error) {
+      console.error('Error generating embedding:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Calculate cosine similarity between two vectors
+   * @param {number[]} a - First vector
+   * @param {number[]} b - Second vector
+   * @returns {number} - Cosine similarity score (0-1)
+   */
+  function cosineSimilarity(a, b) {
+    if (a.length !== b.length) {
+      throw new Error('Vectors must have the same length');
+    }
+
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+
+    for (let i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+
+    if (normA === 0 || normB === 0) {
+      return 0;
+    }
+
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  /**
+   * Split document into chunks for better embedding performance
+   * @param {string} content - Document content
+   * @param {string} filename - Document filename
+   * @returns {Array} - Array of document chunks
+   */
+  function createDocumentChunks(content, filename) {
+    const chunks = [];
+    const chunkSize = EMBEDDING_CONFIG.CHUNK_SIZE;
+    const overlap = EMBEDDING_CONFIG.CHUNK_OVERLAP;
+
+    // Split by paragraphs first, then by sentences if needed
+    const paragraphs = content.split(/\n\s*\n/).filter(p => p.trim().length > 0);
+    
+    let currentChunk = '';
+    let chunkIndex = 0;
+
+    for (const paragraph of paragraphs) {
+      if (currentChunk.length + paragraph.length <= chunkSize) {
+        currentChunk += (currentChunk ? '\n\n' : '') + paragraph;
+      } else {
+        if (currentChunk) {
+          chunks.push({
+            id: `${filename}_chunk_${chunkIndex}`,
+            content: currentChunk,
+            filename: filename,
+            chunkIndex: chunkIndex,
+            startPos: Math.max(0, currentChunk.length - overlap)
+          });
+          chunkIndex++;
+        }
+        
+        // Start new chunk, potentially with overlap
+        if (paragraph.length > chunkSize) {
+          // Split large paragraph into smaller chunks
+          for (let i = 0; i < paragraph.length; i += chunkSize - overlap) {
+            const chunk = paragraph.substring(i, i + chunkSize);
+            chunks.push({
+              id: `${filename}_chunk_${chunkIndex}`,
+              content: chunk,
+              filename: filename,
+              chunkIndex: chunkIndex,
+              startPos: i
+            });
+            chunkIndex++;
+          }
+          currentChunk = '';
+        } else {
+          currentChunk = paragraph;
+        }
+      }
+    }
+
+    // Add remaining content
+    if (currentChunk) {
+      chunks.push({
+        id: `${filename}_chunk_${chunkIndex}`,
+        content: currentChunk,
+        filename: filename,
+        chunkIndex: chunkIndex,
+        startPos: 0
+      });
+    }
+
+    return chunks;
+  }
+
+  /**
+   * Process and generate embeddings for all documents
+   * @param {Object} filesContentMap - Map of filename to content
+   * @returns {Promise<Array>} - Array of document chunks with embeddings
+   */
+  async function processDocumentsForEmbeddings(filesContentMap) {
+    console.log('🧠 Processing documents for semantic search...');
+    const allChunks = [];
+
+    for (const [filename, content] of Object.entries(filesContentMap)) {
+      if (!content || content.trim().length === 0) continue;
+
+      try {
+        // Check if we already have embeddings for this document
+        const cacheKey = `${filename}_${content.length}`;
+        if (embeddingsCache.has(cacheKey)) {
+          allChunks.push(...embeddingsCache.get(cacheKey));
+          continue;
+        }
+
+        console.log(`🔄 Processing ${filename}...`);
+        const chunks = createDocumentChunks(content, filename);
+        const chunksWithEmbeddings = [];
+
+        for (const chunk of chunks) {
+          try {
+            const embedding = await generateEmbedding(chunk.content);
+            chunksWithEmbeddings.push({
+              ...chunk,
+              embedding: embedding
+            });
+            
+            // Small delay to avoid rate limits
+            await new Promise(resolve => setTimeout(resolve, 100));
+          } catch (error) {
+            console.warn(`Failed to generate embedding for chunk ${chunk.id}:`, error);
+          }
+        }
+
+        // Cache the results
+        embeddingsCache.set(cacheKey, chunksWithEmbeddings);
+        documentChunksCache.set(filename, chunksWithEmbeddings);
+        allChunks.push(...chunksWithEmbeddings);
+
+        console.log(`✅ Processed ${filename}: ${chunksWithEmbeddings.length} chunks`);
+      } catch (error) {
+        console.error(`Error processing ${filename}:`, error);
+      }
+    }
+
+    console.log(`🎯 Total processed chunks: ${allChunks.length}`);
+    return allChunks;
+  }
+
+  /**
+   * Perform semantic search across documents
+   * @param {string} query - User query
+   * @param {Array} documentChunks - Array of document chunks with embeddings
+   * @returns {Promise<Array>} - Ranked search results
+   */
+  async function performSemanticSearch(query, documentChunks) {
+    try {
+      console.log(`🔍 Performing semantic search for: "${query}"`);
+      
+      // Generate embedding for the query
+      const queryEmbedding = await generateEmbedding(query);
+      
+      // Calculate similarity with all document chunks
+      const similarities = documentChunks.map(chunk => {
+        const similarity = cosineSimilarity(queryEmbedding, chunk.embedding);
+        return {
+          ...chunk,
+          similarity: similarity
+        };
+      });
+
+      // Sort by similarity and filter by threshold
+      const rankedResults = similarities
+        .filter(result => result.similarity >= EMBEDDING_CONFIG.SIMILARITY_THRESHOLD)
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, EMBEDDING_CONFIG.MAX_DOCUMENTS_FOR_CONTEXT);
+
+      console.log(`✅ Found ${rankedResults.length} relevant chunks`);
+      return rankedResults;
+      
+    } catch (error) {
+      console.error('Error in semantic search:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Enhanced search that combines keyword and semantic search
+   * @param {string} query - User query
+   * @param {Object} filesContentMap - Map of files to content
+   * @param {Array} transcriptResults - Results from transcript search
+   * @returns {Promise<Object>} - Combined search results
+   */
+  async function performEnhancedSearch(query, filesContentMap, transcriptResults = []) {
+    try {
+      // Step 1: Process documents and generate embeddings if not already done
+      const documentChunks = await processDocumentsForEmbeddings(filesContentMap);
+      
+      // Step 2: Perform semantic search
+      const semanticResults = await performSemanticSearch(query, documentChunks);
+      
+      // Step 3: Combine with existing keyword search results
+      const keywordResults = await searchFilesContent(filesContentMap, query);
+      
+      // Step 4: Merge and deduplicate results
+      const combinedResults = mergeSearchResults(semanticResults, keywordResults, transcriptResults);
+      
+      return {
+        semanticResults: semanticResults,
+        keywordResults: keywordResults,
+        transcriptResults: transcriptResults,
+        combinedResults: combinedResults,
+        totalRelevantChunks: semanticResults.length
+      };
+      
+    } catch (error) {
+      console.error('Error in enhanced search:', error);
+      return {
+        semanticResults: [],
+        keywordResults: keywordResults || [],
+        transcriptResults: transcriptResults || [],
+        combinedResults: [],
+        totalRelevantChunks: 0
+      };
+    }
+  }
+
+  /**
+   * Merge different types of search results
+   * @param {Array} semanticResults - Semantic search results
+   * @param {Array} keywordResults - Keyword search results
+   * @param {Array} transcriptResults - Transcript search results
+   * @returns {Array} - Merged and ranked results
+   */
+  function mergeSearchResults(semanticResults, keywordResults, transcriptResults) {
+    const resultMap = new Map();
+    
+    // Add semantic results (highest priority for file content)
+    semanticResults.forEach((result, index) => {
+      const key = `${result.filename}_${result.chunkIndex}`;
+      resultMap.set(key, {
+        ...result,
+        type: 'semantic',
+        finalScore: result.similarity * 10 + (semanticResults.length - index), // Boost semantic results
+        contexts: [{
+          text: result.content.substring(0, 300) + (result.content.length > 300 ? '...' : ''),
+          relevance: result.similarity,
+          type: 'semantic_match'
+        }]
+      });
+    });
+    
+    // Add keyword results with lower priority
+    keywordResults.forEach((result, index) => {
+      const key = `${result.filename}_keyword`;
+      if (!resultMap.has(key)) {
+        resultMap.set(key, {
+          ...result,
+          type: 'keyword',
+          finalScore: result.score + (keywordResults.length - index),
+          similarity: result.score / 10 // Normalize to 0-1 range
+        });
+      } else {
+        // Boost score if found in both semantic and keyword search
+        const existing = resultMap.get(key);
+        existing.finalScore += result.score;
+        existing.type = 'combined';
+      }
+    });
+    
+    // Add transcript results
+    transcriptResults.forEach((result, index) => {
+      const key = `transcript_${result.docId}`;
+      resultMap.set(key, {
+        ...result,
+        type: 'transcript',
+        finalScore: result.score + (transcriptResults.length - index),
+        similarity: result.score / 10
+      });
+    });
+    
+    // Sort by final score and return top results
+    return Array.from(resultMap.values())
+      .sort((a, b) => b.finalScore - a.finalScore)
+      .slice(0, EMBEDDING_CONFIG.MAX_DOCUMENTS_FOR_CONTEXT);
+  }
+
+  /**
+   * Build context for AI from search results
+   * @param {Array} searchResults - Combined search results
+   * @returns {string} - Formatted context string
+   */
+  function buildEnhancedContext(searchResults) {
+    if (!searchResults || searchResults.length === 0) {
+      return "";
+    }
+
+    let context = "RELEVANT DOCUMENTS AND CONTEXT:\n\n";
+    
+    searchResults.forEach((result, index) => {
+      context += `Document ${index + 1}: ${result.filename || 'Meeting Transcript'}\n`;
+      context += `Relevance Score: ${(result.similarity || result.score / 10).toFixed(3)}\n`;
+      context += `Type: ${result.type}\n`;
+      
+      if (result.contexts && result.contexts.length > 0) {
+        context += "Content:\n";
+        result.contexts.forEach(ctx => {
+          context += `"${ctx.text}"\n`;
+        });
+      } else if (result.content) {
+        const preview = result.content.length > 500 
+          ? result.content.substring(0, 500) + "..."
+          : result.content;
+        context += `Content: "${preview}"\n`;
+      }
+      
+      context += "\n---\n\n";
+    });
+
+    return context;
+  }
+
   // ENHANCED AI FUNCTIONS START HERE
 
   // Enhanced function to search through all transcript documents with semantic search
@@ -394,7 +764,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const patterns = {
       // Drive file operations
       drive_files: [
-        /\b(show|list|display|find|what.*files?|which.*files?)\b.*\b(drive|folder|files?|documents?)\b/i,
+        /\b(show|give|list|display|find|what.*files?|which.*files?)\b.*\b(drive|folder|files?|documents?)\b/i,
         /\bfiles? in\b.*\b(drive|folder)\b/i,
         /\bwhat.*inside.*drive\b/i,
         /\blist.*documents?\b/i,
@@ -478,7 +848,6 @@ document.addEventListener("DOMContentLoaded", () => {
       mentionsTranscriptOnly
     };
   }
-
 
   // Enhanced function to determine if query needs transcript search
   function needsTranscriptSearch(query) {
@@ -602,8 +971,8 @@ document.addEventListener("DOMContentLoaded", () => {
     return 'general';
   }
 
-  // MAIN ENHANCED AI RESPONSE FUNCTION WITH SMART ROUTING
-  async function getEnhancedAIResponse(input, selectedMeeting, userUid, filesContentMap, getAIResponse) {
+  // ENHANCED AI RESPONSE FUNCTION WITH SEMANTIC SEARCH
+  async function getEnhancedAIResponseWithSemantics(input, selectedMeeting, userUid, filesContentMap, getAIResponse) {
     const questionIntent = analyzeQuestionIntent(input);
     const questionCategory = categorizeQuestion(input);
 
@@ -613,13 +982,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const needsTranscriptLookup = mentionsTranscriptOnly || (!mentionsSpecificFile && !mentionsTranscriptOnly);
     const needsFileAccess = mentionsSpecificFile || (!mentionsSpecificFile && !mentionsTranscriptOnly);
 
-    
     console.log(`🤖 AI Analysis: Intent="${questionIntent}", Category="${questionCategory}"`);
     
     let transcriptContext = "";
-    let fileContext = "";
     let searchResults = [];
-    let fileSearchResults = [];
+    let enhancedSearchResults = null;
     
     // Handle transcript-related questions
     if (needsTranscriptLookup && selectedMeeting?.meetingId) {
@@ -645,34 +1012,27 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
     
-    // Handle file-related questions
-    if (needsFileAccess) {
-      console.log(`📁 Searching files for: ${input}`);
+    // Handle file-related questions with enhanced semantic search
+    if (needsFileAccess && filesContentMap && Object.keys(filesContentMap).length > 0) {
+      console.log(`📁 Performing enhanced search for: ${input}`);
       
-      if (questionIntent === 'search_files' || questionIntent === 'file_search') {
-        // Search within file contents
-        fileSearchResults = await searchFilesContent(filesContentMap, input);
-        
-        if (fileSearchResults.length > 0) {
-          fileContext = fileSearchResults.map((result, index) => {
-            const contextTexts = result.contexts.map(ctx => `"${ctx.text}"`).join('\n');
-            return `File: ${result.filename} (relevance: ${result.score})\n${contextTexts}`;
-          }).join('\n\n');
-          console.log(`✅ Found content in ${fileSearchResults.length} files`);
-        }
-      } else {
-        // Build general file context
-        if (filesContentMap && Object.keys(filesContentMap).length > 0) {
-          const fileTexts = [];
-          for (const [filename, content] of Object.entries(filesContentMap)) {
-            if (content && content.length > 0) {
-              const preview = content.length > 500 ? content.substring(0, 500) + "..." : content;
-              fileTexts.push(`File: ${filename}\n${preview}`);
-            }
-          }
-          fileContext = fileTexts.join('\n\n');
-          console.log(`📄 Loaded ${Object.keys(filesContentMap).length} files for context`);
-        }
+      try {
+        enhancedSearchResults = await performEnhancedSearch(input, filesContentMap, searchResults);
+        console.log(`🎯 Enhanced search completed:`, {
+          semantic: enhancedSearchResults.semanticResults.length,
+          keyword: enhancedSearchResults.keywordResults.length,
+          transcript: enhancedSearchResults.transcriptResults.length,
+          combined: enhancedSearchResults.combinedResults.length
+        });
+      } catch (error) {
+        console.error('Enhanced search failed, falling back to keyword search:', error);
+        enhancedSearchResults = {
+          semanticResults: [],
+          keywordResults: await searchFilesContent(filesContentMap, input),
+          transcriptResults: searchResults,
+          combinedResults: [],
+          totalRelevantChunks: 0
+        };
       }
     }
 
@@ -681,7 +1041,7 @@ document.addEventListener("DOMContentLoaded", () => {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
     });
     
-    let systemPrompt = `You are an intelligent meeting assistant with access to meeting transcripts and documents.
+    let systemPrompt = `You are an intelligent meeting assistant with access to meeting transcripts and documents. You now have advanced semantic search capabilities.
 
 Today's date: ${today}
 
@@ -690,42 +1050,27 @@ QUESTION ANALYSIS:
 - Category: ${questionCategory.toUpperCase()}
 - Needs transcript data: ${needsTranscriptLookup}
 - Needs file data: ${needsFileAccess}
+- Semantic Search: ${enhancedSearchResults ? 'ENABLED' : 'DISABLED'}
 
 `;
 
-    // Add transcript context if needed
+    // Add enhanced context from semantic search
+    if (enhancedSearchResults && enhancedSearchResults.combinedResults.length > 0) {
+      const enhancedContext = buildEnhancedContext(enhancedSearchResults.combinedResults);
+      systemPrompt += `SEMANTIC SEARCH RESULTS:\n${enhancedContext}\n`;
+      
+      systemPrompt += `SEARCH PERFORMANCE:
+- Semantic matches: ${enhancedSearchResults.semanticResults.length}
+- Keyword matches: ${enhancedSearchResults.keywordResults.length}
+- Transcript matches: ${enhancedSearchResults.transcriptResults.length}
+- Combined relevant results: ${enhancedSearchResults.combinedResults.length}
+
+`;
+    }
+
+    // Add transcript context if available
     if (transcriptContext && transcriptContext.length > 0) {
-      systemPrompt += `MEETING TRANSCRIPT CONTEXT:
-${transcriptContext}
-
-Use this transcript information to answer questions about what happened in the meeting, who said what, decisions made, etc. Provide specific quotes when available.
-
-`;
-    }
-
-    // Add file context if needed
-    if (fileContext && fileContext.length > 0) {
-      systemPrompt += `DRIVE FILES CONTEXT:
-${fileContext}
-
-Use this file information to answer questions about documents, file contents, or when searching for information within files.
-
-`;
-    }
-
-    // Add search results summary
-    if (searchResults.length > 0) {
-      systemPrompt += `TRANSCRIPT SEARCH RESULTS:
-Found ${searchResults.length} relevant sections with matches: ${searchResults.map(r => r.matchedPhrases.join(', ')).join('; ')}
-
-`;
-    }
-
-    if (fileSearchResults.length > 0) {
-      systemPrompt += `FILE SEARCH RESULTS:
-Found relevant content in ${fileSearchResults.length} files: ${fileSearchResults.map(r => r.filename).join(', ')}
-
-`;
+      systemPrompt += `MEETING TRANSCRIPT CONTEXT:\n${transcriptContext}\n\n`;
     }
 
     // Add specific instructions based on intent
@@ -759,9 +1104,12 @@ Found relevant content in ${fileSearchResults.length} files: ${fileSearchResults
         break;
       
       default:
-        systemPrompt += `- Provide a helpful response using available information
-- Clearly indicate which sources you're using (transcript vs files)
-- If information isn't available, suggest how to find it`;
+        systemPrompt += `- Use the semantic search results as your primary source of information
+- Prioritize information from higher relevance scores
+- When referencing information, mention the source document name
+- If semantic search found relevant content, focus on that over general knowledge
+- Provide specific quotes when available
+- If no relevant information was found, clearly state this`;
     }
 
     systemPrompt += `
@@ -788,25 +1136,29 @@ MEETING DETAILS (reference only when specifically asked):
       const aiReply = await getAIResponse(messages);
       return {
         response: aiReply,
-        searchResults: searchResults,
-        fileSearchResults: fileSearchResults,
+        searchResults: enhancedSearchResults || { combinedResults: [] },
+        hasSemanticResults: enhancedSearchResults?.semanticResults?.length > 0,
+        hasKeywordResults: enhancedSearchResults?.keywordResults?.length > 0,
         hasTranscriptContext: transcriptContext.length > 0,
-        hasFileContext: fileContext.length > 0,
+        hasFileContext: enhancedSearchResults?.combinedResults?.length > 0,
         questionIntent: questionIntent,
         questionCategory: questionCategory,
+        semanticScore: enhancedSearchResults?.combinedResults?.[0]?.similarity || 0,
         searchTerms: [...(searchResults.length > 0 ? searchResults[0].matchedPhrases : []), 
-                      ...(fileSearchResults.length > 0 ? fileSearchResults[0].matchedPhrases : [])]
+                      ...(enhancedSearchResults?.keywordResults?.length > 0 ? enhancedSearchResults.keywordResults[0].matchedPhrases : [])]
       };
     } catch (error) {
       console.error("AI response error:", error);
       return {
         response: "I'm having trouble processing your request right now. Please try again.",
-        searchResults: [],
-        fileSearchResults: [],
+        searchResults: { combinedResults: [] },
+        hasSemanticResults: false,
+        hasKeywordResults: false,
         hasTranscriptContext: false,
         hasFileContext: false,
         questionIntent: 'error',
         questionCategory: 'error',
+        semanticScore: 0,
         searchTerms: []
       };
     }
@@ -814,23 +1166,21 @@ MEETING DETAILS (reference only when specifically asked):
 
   // Function to highlight search terms in response
   function highlightSearchTerms(text, searchTerms) {
-  if (!searchTerms || searchTerms.length === 0) return text;
+    if (!searchTerms || searchTerms.length === 0) return text;
 
-  let highlightedText = text;
+    let highlightedText = text;
 
-  searchTerms.forEach(term => {
-    // Properly escape special regex characters
-    const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Match whole word with word boundaries and ignore case
-    const regex = new RegExp(`\\b(${escapedTerm})\\b`, 'gi');
-    highlightedText = highlightedText.replace(regex, '<mark>$1</mark>');
-  });
+    searchTerms.forEach(term => {
+        // Properly escape special regex characters
+        const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        
+        // Match whole word with word boundaries and ignore case
+        const regex = new RegExp(`\\b(${escapedTerm})\\b`, 'gi');
+        highlightedText = highlightedText.replace(regex, '<mark>$1</mark>');
+    });
 
-  return highlightedText;
+    return highlightedText;
 }
-
-
-  // ENHANCED AI FUNCTIONS END HERE
 
   function getMeetingStatus(meetingDateStr) {
     const today = new Date();
@@ -1050,6 +1400,7 @@ MEETING DETAILS (reference only when specifically asked):
     if (!res.ok) throw new Error('Failed to download text file: ' + res.status);
     return await res.text();
   }
+
   function loadMammothIfNeeded() {
     return new Promise((resolve, reject) => {
       if (window.mammoth) return resolve(window.mammoth);
@@ -1092,103 +1443,101 @@ MEETING DETAILS (reference only when specifically asked):
       document.head.appendChild(script);
     });
   }
+
   // Function to download and process different file types
   async function downloadFileContent(file, token) {
-  try {
-    let content = "";
+    try {
+      let content = "";
 
-    switch (file.mimeType) {
-      case 'application/vnd.google-apps.document':
-        content = await downloadGoogleDocAsText(file.id, token);
-        break;
+      switch (file.mimeType) {
+        case 'application/vnd.google-apps.document':
+          content = await downloadGoogleDocAsText(file.id, token);
+          break;
 
-      case 'text/plain':
-      case 'text/csv':
-      case 'text/markdown':
-        content = await downloadPlainTextFile(file.id, token);
-        break;
+        case 'text/plain':
+        case 'text/csv':
+        case 'text/markdown':
+          content = await downloadPlainTextFile(file.id, token);
+          break;
 
-      case 'application/vnd.google-apps.spreadsheet': {
-        const csvRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/csv`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        if (csvRes.ok) {
-          content = await csvRes.text();
-        }
-        break;
-      }
-
-      case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
-        const blobRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-
-        if (!blobRes.ok) throw new Error(`Failed to download DOCX file: ${blobRes.status}`);
-        const blob = await blobRes.blob();
-        const arrayBuffer = await blob.arrayBuffer();
-
-        await loadMammothIfNeeded();
-        const { convertToHtml } = window.mammoth;
-
-        const result = await convertToHtml({ arrayBuffer });
-        content = result.value.replace(/<[^>]+>/g, ''); // Strip HTML tags
-        break;
-      }
-
-      case 'application/vnd.openxmlformats-officedocument.presentationml.presentation': {
-        const blobRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-
-        if (!blobRes.ok) throw new Error(`Failed to download PPTX file: ${blobRes.status}`);
-        const blob = await blobRes.blob();
-        const arrayBuffer = await blob.arrayBuffer();
-
-        await loadPptxParserIfNeeded(); // <-- New helper function
-        const text = await window.pptxToText(arrayBuffer);
-        content = text;
-        break;
-      }
-
-      case 'application/pdf': {
-        const res = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-
-        if (!res.ok) throw new Error(`Failed to download PDF file: ${res.status}`);
-        const blob = await res.blob();
-        const arrayBuffer = await blob.arrayBuffer();
-
-        await loadPdfJSIfNeeded();
-
-        const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-
-        let text = "";
-        for (let i = 1; i <= pdf.numPages; i++) {
-          const page = await pdf.getPage(i);
-          const pageContent = await page.getTextContent();
-          const pageText = pageContent.items.map(item => item.str).join(" ");
-          text += pageText + "\n\n";
+        case 'application/vnd.google-apps.spreadsheet': {
+          const csvRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/csv`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          if (csvRes.ok) {
+            content = await csvRes.text();
+          }
+          break;
         }
 
-        content = text;
-        break;
+        case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
+          const blobRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+
+          if (!blobRes.ok) throw new Error(`Failed to download DOCX file: ${blobRes.status}`);
+          const blob = await blobRes.blob();
+          const arrayBuffer = await blob.arrayBuffer();
+
+          await loadMammothIfNeeded();
+          const { convertToHtml } = window.mammoth;
+
+          const result = await convertToHtml({ arrayBuffer });
+          content = result.value.replace(/<[^>]+>/g, ''); // Strip HTML tags
+          break;
+        }
+
+        case 'application/vnd.openxmlformats-officedocument.presentationml.presentation': {
+          const blobRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+
+          if (!blobRes.ok) throw new Error(`Failed to download PPTX file: ${blobRes.status}`);
+          const blob = await blobRes.blob();
+          const arrayBuffer = await blob.arrayBuffer();
+
+          await loadPptxParserIfNeeded();
+          const text = await window.pptxToText(arrayBuffer);
+          content = text;
+          break;
+        }
+
+        case 'application/pdf': {
+          const res = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+
+          if (!res.ok) throw new Error(`Failed to download PDF file: ${res.status}`);
+          const blob = await res.blob();
+          const arrayBuffer = await blob.arrayBuffer();
+
+          await loadPdfJSIfNeeded();
+
+          const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+          let text = "";
+          for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const pageContent = await page.getTextContent();
+            const pageText = pageContent.items.map(item => item.str).join(" ");
+            text += pageText + "\n\n";
+          }
+
+          content = text;
+          break;
+        }
+
+        default:
+          console.log(`Unsupported file type: ${file.mimeType} for file: ${file.name}`);
+          return null;
       }
 
-      default:
-        console.log(`Unsupported file type: ${file.mimeType} for file: ${file.name}`);
-        return null;
+      return content;
+    } catch (error) {
+      console.error(`Error downloading file ${file.name}:`, error);
+      return null;
     }
-
-    return content;
-  } catch (error) {
-    console.error(`Error downloading file ${file.name}:`, error);
-    return null;
   }
-}
-
-
-
 
   // Enhanced search function with better filtering
   async function searchFilesRecursively(folderId, queryText, token) {
@@ -1432,7 +1781,6 @@ MEETING DETAILS (reference only when specifically asked):
     });
 
     // Function to preload Drive files
-    // Function to preload Drive files - FIXED VERSION
     async function preloadDriveFiles() {
       if (!selectedMeeting?.driveFolderLink) {
         console.log("No Drive folder link available");
@@ -1482,7 +1830,7 @@ MEETING DETAILS (reference only when specifically asked):
             if (content && content.trim().length > 0) {
               const fileKey = file.name.toLowerCase();
               filesContentMap[fileKey] = content;
-              loadedCount++; // INCREMENT COUNTER HERE - AFTER SUCCESSFUL LOAD
+              loadedCount++;
               console.log(`📄 Loaded: ${file.name} (${content.length} chars)`);
             } else {
               console.warn(`⚠️ No content extracted from: ${file.name}`);
@@ -1501,10 +1849,10 @@ MEETING DETAILS (reference only when specifically asked):
       }
     }
 
-    // Enhanced chat input handler
+    // Enhanced chat input handler with semantic search
     chatInput.addEventListener("keydown", async (e) => {
       if (e.key !== "Enter" || isProcessing) return;
-      console.log("🎯 Processing input:", chatInput.value);
+      console.log("🎯 Processing input with semantic search:", chatInput.value);
       isProcessing = true;
 
       const input = chatInput.value.trim();
@@ -1529,7 +1877,7 @@ MEETING DETAILS (reference only when specifically asked):
       // Add thinking bubble
       const aiBubble = document.createElement("div");
       aiBubble.className = "chat-bubble ai-bubble";
-      aiBubble.innerHTML = '<div class="typing-indicator">🤖 Analyzing your question...</div>';
+      aiBubble.innerHTML = '<div class="typing-indicator">🧠 Analyzing with semantic search...</div>';
       chatMessages.appendChild(aiBubble);
 
       if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -1551,8 +1899,8 @@ MEETING DETAILS (reference only when specifically asked):
         } else if (questionIntent === 'file_search' || questionIntent === 'search_files') {
           await handleFileSearchQuery(input, aiBubble);
         } else {
-          // Use enhanced AI response for all other queries
-          await handleGeneralQuery(input, aiBubble);
+          // Use enhanced AI response with semantic search
+          await handleGeneralQueryWithSemantics(input, aiBubble);
         }
 
       } catch (error) {
@@ -1697,28 +2045,33 @@ MEETING DETAILS (reference only when specifically asked):
       }
     }
 
-    // Handle general queries with enhanced AI
-    async function handleGeneralQuery(input, aiBubble) {
-      aiBubble.innerHTML = '<div class="typing-indicator">🤖 Thinking...</div>';
+    // Handle general queries with enhanced semantic search
+    async function handleGeneralQueryWithSemantics(input, aiBubble) {
+      aiBubble.innerHTML = '<div class="typing-indicator">🧠 Thinking with semantic search...</div>';
 
       // Load additional files if needed
       await ensureFilesLoaded();
 
       try {
-        // Use the enhanced AI response function
-        const enhancedResponse = await getEnhancedAIResponse(input, selectedMeeting, userUid, filesContentMap, getAIResponse);
+        // Use the enhanced AI response function with semantic search
+        const enhancedResponse = await getEnhancedAIResponseWithSemantics(
+          input, selectedMeeting, userUid, filesContentMap, getAIResponse
+        );
 
         // Display the AI response with highlighting
         const responseText = highlightSearchTerms(enhancedResponse.response, enhancedResponse.searchTerms);
         aiBubble.innerHTML = linkify(responseText);
 
-        // Add context indicators
+        // Add enhanced context indicators
         const indicators = [];
-        if (enhancedResponse.hasTranscriptContext) {
-          indicators.push(`📝 Transcript (${enhancedResponse.searchResults.length} sections)`);
+        if (enhancedResponse.hasSemanticResults) {
+          indicators.push(`🧠 Semantic (${enhancedResponse.searchResults.semanticResults?.length || 0} matches)`);
         }
-        if (enhancedResponse.hasFileContext) {
-          indicators.push(`📁 Files (${enhancedResponse.fileSearchResults.length} matches)`);
+        if (enhancedResponse.hasKeywordResults) {
+          indicators.push(`🔍 Keyword (${enhancedResponse.searchResults.keywordResults?.length || 0} matches)`);
+        }
+        if (enhancedResponse.hasTranscriptContext) {
+          indicators.push(`📝 Transcript`);
         }
 
         if (indicators.length > 0) {
@@ -1734,7 +2087,12 @@ MEETING DETAILS (reference only when specifically asked):
             border-left: 3px solid #4CAF50;
             font-style: italic;
           `;
-          contextInfo.innerHTML = `✨ ${indicators.join(' • ')} • Intent: ${enhancedResponse.questionIntent}`;
+          
+          const semanticScore = enhancedResponse.semanticScore > 0 
+            ? ` • Relevance: ${(enhancedResponse.semanticScore * 100).toFixed(1)}%` 
+            : '';
+          
+          contextInfo.innerHTML = `✨ ${indicators.join(' • ')} • Intent: ${enhancedResponse.questionIntent}${semanticScore}`;
           aiBubble.appendChild(contextInfo);
         }
 

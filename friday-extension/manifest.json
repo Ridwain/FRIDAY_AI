@@ -30,7 +30,8 @@
     "https://meet.google.com/*",
     "https://*.zoom.us/*",
     "https://*.zoom.com/*",
-    "https://api.openai.com/"
+    "https://api.openai.com/",
+    "https://api.openai.com/*"
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self';"
