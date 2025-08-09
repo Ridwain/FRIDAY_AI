@@ -439,43 +439,50 @@ document.addEventListener("DOMContentLoaded", () => {
 }
 
 
-async function performRAGSearch(query) {
+async function performRAGSearch(query, namespace) {
   try {
-    console.log(`🔍 RAG search for: "${query}"`);
-    
-    // Generate query embedding
     const queryEmbedding = await generateEmbedding(query);
-    if (!queryEmbedding) {
-      throw new Error('Failed to generate query embedding');
+    if (!queryEmbedding) throw new Error('Failed to generate query embedding');
+
+    // Build request body; include namespace only if provided
+    const requestBody = {
+      queryEmbedding,
+      topK: RAG_CONFIG.MAX_RESULTS,
+      includeMetadata: true
+    };
+    if (namespace) {
+      requestBody.namespace = namespace;
     }
-    
-    // Search vector database
+
     const response = await fetch(`${RAG_CONFIG.SERVER_URL}/search`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ 
-        queryEmbedding: queryEmbedding,
-        topK: RAG_CONFIG.MAX_RESULTS,
-        includeMetadata: true
-      })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody)
     });
 
-    if (!response.ok) {
-      throw new Error(`Search failed: ${response.status}`);
-    }
-
+    if (!response.ok) throw new Error(`Search failed: ${response.status}`);
     const results = await response.json();
-    console.log(`✅ Found ${results.length} relevant documents`);
-    
     return results;
-    
   } catch (error) {
     console.error('RAG search error:', error);
     return [];
   }
 }
+
+
+/**
+ * Performs two searches: one in the meeting-specific namespace and one in the default.
+ * Combines and sorts the results by similarity.
+ */
+async function performCombinedRAGSearch(query, meetingId) {
+  const transcriptResults = await performRAGSearch(query, meetingId);
+  const driveResults = await performRAGSearch(query); // default namespace
+  const combined = [...transcriptResults, ...driveResults]
+    .sort((a, b) => b.similarity - a.similarity);
+  // Limit to the configured maximum
+  return combined.slice(0, RAG_CONFIG.MAX_RESULTS);
+}
+
 
 
 async function processAndUploadDocuments(filesContentMap) {
@@ -837,72 +844,87 @@ function createSimpleChunks(content, filename) {
 
   // Rest of your existing functions...
   
-  function analyzeQuestionIntent(query) {
-    const queryLower = query.toLowerCase();
-    if (/\.(pptx|docx?|pdf|txt|csv|md)$/i.test(queryLower)) return 'file_content';
+// Enhanced analyzeQuestionIntent function
+function analyzeQuestionIntent(query) {
+  const queryLower = query.toLowerCase();
+  
+  // Check for explicit file extensions
+  if (/\.(pptx|docx?|pdf|txt|csv|md)$/i.test(queryLower)) return 'file_content';
 
-    const patterns = {
-      drive_files: [
-        /\b(show|give|list|display|find|what.*files?|which.*files?)\b.*\b(drive|folder|files?|documents?)\b/i,
-        /\bfiles? in\b.*\b(drive|folder)\b/i,
-        /\bwhat.*inside.*drive\b/i,
-        /\blist.*documents?\b/i,
-        /\bshow.*folder\b/i,
-        /\bdrive folder\b/i
-      ],
-      
-      file_content: [
-        /\b(?:_?[A-Za-z0-9\s-]+\.docx?)\b/i,
-        /\b(?:_?[A-Za-z0-9\s-]+\.txt|\.csv|\.md|\.pdf|\.pptx)\b/i,
-        /\bread.*file/i,
-        /\bopen.*file/i,
-        /\bshow.*file/i,
-        /\bextract.*from.*file/i,
-        /\bwhat.*(?:inside|in|from).*file/i,
-        /\bfile.*contains?\b/i,
-        /\bcontents? of\b.*file/i,
-        /\bdata.*in.*file/i,
-        /\binfo.*from.*file/i,
-        /\bwhat.*project.*(?:discussed|in).*file/i,
-        /\bname.*of.*project.*in.*file/i,
-        /\b(?:title|name).*in.*(?:_?[A-Za-z0-9\s-]+\.docx?)\b/i
-      ],
-
-      meeting_transcript: [
-        /\b(what.*did|who.*said|when.*did|how.*did|why.*did)\b/i,
-        /\b(discuss|discussed|talk|talked|mention|mentioned|said|spoke)\b/i,
-        /\b(meeting|conversation|call|session)\b/i,
-        /\b(decide|decided|agree|agreed|conclude|concluded)\b/i,
-        /\b(action.*item|next.*step|follow.*up|task)\b/i,
-        /\bhappened.*in.*meeting\b/i,
-        /\bwhat.*was.*discussed\b/i,
-        /\bwho.*was.*present\b/i,
-        /\bmeeting.*about\b/i,
-        /\btranscript/i
-      ],
-      
-      search_files: [
-        /\bsearch.*in.*files?\b/i,
-        /\bfind.*in.*documents?\b/i,
-        /\blook.*for.*in.*drive\b/i,
-        /\bsearch.*drive.*for\b/i
-      ],
-      
-      file_search: [
-        /\bsearch\b.*\bfor\b/i,
-        /\bfind\b.*\bfile/i,
-        /\blook.*for\b/i
-      ]
-    };
+  const patterns = {
+    drive_files: [
+      // More comprehensive Drive file patterns
+      /\b(show|give|list|display|find|what).*\b(files?|documents?|drive|folder)\b/i,
+      /\bfiles? in\b.*\b(drive|folder)\b/i,
+      /\bwhat.*inside.*drive\b/i,
+      /\blist.*documents?\b/i,
+      /\bshow.*folder\b/i,
+      /\bdrive folder\b/i,
+      /\ball.*files?\b/i,
+      /\bavailable.*files?\b/i,
+      /\bfiles?.*uploaded\b/i,
+      /\buploaded.*files?\b/i,
+      /^what files/i,
+      /^which files/i,
+      /^any files/i,
+      /^files in/i,
+      /^documents in/i,
+      /\bfolder.*contents?\b/i,
+      /\bcontents?.*of.*folder\b/i,
+      /\bdrive.*contents?\b/i
+    ],
     
-    for (const [intent, regexArray] of Object.entries(patterns)) {
-      if (regexArray.some(regex => regex.test(queryLower))) {
-        return intent;
-      }
+    file_content: [
+      /\b(?:_?[A-Za-z0-9\s-]+\.docx?)\b/i,
+      /\b(?:_?[A-Za-z0-9\s-]+\.txt|\.csv|\.md|\.pdf|\.pptx)\b/i,
+      /\bread.*file/i,
+      /\bopen.*file/i,
+      /\bshow.*file/i,
+      /\bextract.*from.*file/i,
+      /\bwhat.*(?:inside|in|from).*file/i,
+      /\bfile.*contains?\b/i,
+      /\bcontents? of\b.*file/i,
+      /\bdata.*in.*file/i,
+      /\binfo.*from.*file/i
+    ],
+
+    meeting_transcript: [
+      /\b(what.*did|who.*said|when.*did|how.*did|why.*did)\b/i,
+      /\b(discuss|discussed|talk|talked|mention|mentioned|said|spoke)\b/i,
+      /\b(meeting|conversation|call|session)\b/i,
+      /\b(decide|decided|agree|agreed|conclude|concluded)\b/i,
+      /\b(action.*item|next.*step|follow.*up|task)\b/i,
+      /\bhappened.*in.*meeting\b/i,
+      /\bwhat.*was.*discussed\b/i,
+      /\bwho.*was.*present\b/i,
+      /\bmeeting.*about\b/i,
+      /\btranscript/i
+    ],
+    
+    search_files: [
+      /\bsearch.*in.*files?\b/i,
+      /\bfind.*in.*documents?\b/i,
+      /\blook.*for.*in.*drive\b/i,
+      /\bsearch.*drive.*for\b/i
+    ],
+    
+    file_search: [
+      /\bsearch\b.*\bfor\b/i,
+      /\bfind\b.*\bfile/i,
+      /\blook.*for\b/i
+    ]
+  };
+  
+  for (const [intent, regexArray] of Object.entries(patterns)) {
+    if (regexArray.some(regex => regex.test(queryLower))) {
+      console.log(`🎯 Intent detected: ${intent} for query: "${queryLower}"`);
+      return intent;
     }
-    
-    return 'general';
   }
+  
+  console.log(`🎯 Intent detected: general for query: "${queryLower}"`);
+  return 'general';
+}
 
   function detectExplicitFileOrTranscriptMention(query) {
     const lower = query.toLowerCase();
@@ -953,33 +975,127 @@ function createSimpleChunks(content, filename) {
     return 'general';
   }
 
-  // ENHANCED AI RESPONSE FUNCTION WITH SEMANTIC SEARCH
+// ENHANCED AI RESPONSE FUNCTION WITH INTELLIGENT SOURCE PRIORITIZATION
 async function getRAGResponseWithContext(input, selectedMeeting, userUid, filesContentMap, getAIResponse) {
   console.log(`🤖 Processing RAG query with context: ${input}`);
   
   let context = "";
+  let searchResults = [];
+  let sourceInfo = "";
   
-  // 1. Search vector database for relevant content
-  const ragResults = await performRAGSearch(input);
+  // 1. Analyze user intent and explicit source mentions
+  const sourceIntent = analyzeSourceIntent(input);
+  console.log(`🎯 Detected source intent: ${sourceIntent.type}`);
   
-  if (ragResults.length > 0) {
-    context = "RELEVANT DOCUMENTS:\n\n";
-    ragResults.forEach((result, index) => {
-      context += `Document ${index + 1}: ${result.filename}\n`;
-      context += `Relevance: ${result.similarity.toFixed(3)}\n`;
-      context += `Content: "${result.content}"\n\n`;
-    });
-  }
-  
-  // 2. Add transcript context if needed and no document context found
-  if (selectedMeeting?.meetingId && !context) {
+  if (sourceIntent.type === 'transcript_only') {
+    // 2A. User explicitly mentioned transcript/meeting - ONLY search transcripts
+    console.log("📝 User explicitly requested transcript information");
+    
     try {
-      const transcript = await loadTranscript(userUid, selectedMeeting.meetingId);
-      if (transcript && transcript.length > 0) {
-        context += `MEETING TRANSCRIPT:\n${transcript.substring(0, 2000)}...\n\n`;
+      const transcriptResults = await performRAGSearch(input, selectedMeeting?.meetingId);
+      
+      if (transcriptResults.length > 0) {
+        context = "MEETING TRANSCRIPT CONTEXT:\n\n";
+        transcriptResults.forEach((result, index) => {
+          context += `Transcript Segment ${index + 1}:\n`;
+          context += `Relevance: ${result.similarity.toFixed(3)}\n`;
+          context += `Content: "${result.content}"\n\n`;
+        });
+        searchResults = transcriptResults;
+        sourceInfo = "Sources: Meeting Transcript";
+      } else {
+        // Fallback to full transcript
+        const transcript = await loadTranscript(userUid, selectedMeeting.meetingId);
+        if (transcript && transcript.length > 0) {
+          context = `MEETING TRANSCRIPT:\n${transcript.substring(0, 4000)}...\n\n`;
+          sourceInfo = "Sources: Meeting Transcript (Full)";
+        }
       }
     } catch (error) {
       console.warn("Could not load transcript:", error);
+      context = "⚠️ Could not access meeting transcript.\n\n";
+    }
+    
+  } else if (sourceIntent.type === 'files_only') {
+    // 2B. User explicitly mentioned files/drive - ONLY search documents
+    console.log("📁 User explicitly requested file information");
+    
+    const documentResults = await performRAGSearch(input); // default namespace for documents
+    if (documentResults.length > 0) {
+      context = "GOOGLE DRIVE FILES CONTEXT:\n\n";
+      documentResults.forEach((result, index) => {
+        context += `Document ${index + 1}: ${result.filename}\n`;
+        context += `Relevance: ${result.similarity.toFixed(3)}\n`;
+        context += `Content: "${result.content}"\n\n`;
+      });
+      searchResults = documentResults;
+      sourceInfo = "Sources: Google Drive Files";
+    } else {
+      context = "⚠️ No relevant information found in Drive files.\n\n";
+      sourceInfo = "Sources: Google Drive Files (No matches)";
+    }
+    
+  } else {
+    // 2C. No explicit source mentioned - search BOTH, transcript first
+    console.log("🔍 No explicit source mentioned, searching both transcript and files");
+    
+    let transcriptResults = [];
+    let documentResults = [];
+    
+    try {
+      // Search transcript first
+      if (selectedMeeting?.meetingId) {
+        transcriptResults = await performRAGSearch(input, selectedMeeting.meetingId);
+        
+        if (transcriptResults.length === 0) {
+          // Fallback to full transcript for important queries
+          const transcript = await loadTranscript(userUid, selectedMeeting.meetingId);
+          if (transcript && transcript.length > 0) {
+            // Create a pseudo-result for display consistency
+            transcriptResults = [{
+              content: transcript.substring(0, 2000),
+              similarity: 0.5,
+              filename: "Meeting Transcript",
+              source: "transcript"
+            }];
+          }
+        }
+      }
+      
+      // Search documents
+      documentResults = await performRAGSearch(input); // default namespace
+      
+      // Build combined context
+      if (transcriptResults.length > 0 || documentResults.length > 0) {
+        context = "";
+        let sources = [];
+        
+        if (transcriptResults.length > 0) {
+          context += "MEETING TRANSCRIPT CONTEXT:\n\n";
+          transcriptResults.forEach((result, index) => {
+            context += `Transcript Segment ${index + 1}:\n`;
+            context += `Content: "${result.content}"\n\n`;
+          });
+          sources.push("Meeting Transcript");
+        }
+        
+        if (documentResults.length > 0) {
+          context += "GOOGLE DRIVE FILES CONTEXT:\n\n";
+          documentResults.forEach((result, index) => {
+            context += `Document ${index + 1}: ${result.filename}\n`;
+            context += `Content: "${result.content}"\n\n`;
+          });
+          sources.push("Google Drive Files");
+        }
+        
+        searchResults = [...transcriptResults, ...documentResults];
+        sourceInfo = `Sources: ${sources.join(" + ")}`;
+      }
+      
+    } catch (error) {
+      console.warn("Error in combined search:", error);
+      context = "⚠️ Error accessing meeting data.\n\n";
+      sourceInfo = "Sources: Error";
     }
   }
   
@@ -987,8 +1103,7 @@ async function getRAGResponseWithContext(input, selectedMeeting, userUid, filesC
   let conversationContext = "";
   if (conversationHistory.length > 0) {
     conversationContext = "RECENT CONVERSATION:\n";
-    // Include last few exchanges for context
-    const recentHistory = conversationHistory.slice(-6); // Last 3 exchanges (6 messages)
+    const recentHistory = conversationHistory.slice(-6);
     recentHistory.forEach((msg, index) => {
       const role = msg.role === "user" ? "User" : "Assistant";
       conversationContext += `${role}: ${msg.content}\n`;
@@ -996,8 +1111,37 @@ async function getRAGResponseWithContext(input, selectedMeeting, userUid, filesC
     conversationContext += "\n";
   }
   
-  // 4. Build enhanced system prompt with conversation awareness
-  const systemPrompt = `You are an intelligent meeting assistant with access to documents via RAG (Retrieval Augmented Generation) and conversation history.
+  // 4. Build enhanced system prompt with source awareness
+  let systemPrompt = "";
+  
+  if (sourceIntent.type === 'transcript_only') {
+    systemPrompt = `You are an intelligent meeting assistant. The user has specifically asked about the MEETING TRANSCRIPT only.
+
+${conversationContext}${context}
+
+CRITICAL INSTRUCTIONS:
+- ONLY use information from MEETING TRANSCRIPT CONTEXT
+- Do NOT reference any file or document information
+- Do NOT use information from recent conversation unless it's about the transcript
+- Focus entirely on what was discussed, decided, or mentioned in the meeting
+- If no meeting transcript context is available, say "I don't have access to the meeting transcript"
+- Provide comprehensive meeting summary when asked
+- Quote specific parts from the transcript when relevant`;
+  
+  } else if (sourceIntent.type === 'files_only') {
+    systemPrompt = `You are an intelligent assistant with access to Google Drive files. The user has specifically asked about DRIVE FILES only.
+
+${conversationContext}${context}
+
+CRITICAL INSTRUCTIONS:
+- ONLY use information from GOOGLE DRIVE FILES CONTEXT
+- Do NOT reference any meeting transcript information
+- Focus on file contents, documents, and drive folder information
+- If no file context is available, say "I don't have access to the requested files"
+- Quote specific content from files when relevant`;
+  
+  } else {
+    systemPrompt = `You are an intelligent meeting assistant with access to meeting transcripts and Google Drive documents.
 
 ${conversationContext}${context}
 
@@ -1006,38 +1150,110 @@ Instructions:
 - For follow-up questions, refer to previous parts of our conversation
 - When someone asks "What is his age?" or similar, look at recent conversation to understand who "his" refers to
 - Use pronouns and references from the conversation context appropriately
-- Quote specific content when relevant
-- If the context doesn't contain relevant information, clearly state this
+- Quote specific content when relevant and mention the source
+- For meeting summaries, provide comprehensive overview from transcript
+- ALWAYS mention where information came from using the source info: "${sourceInfo}"
+- If no relevant information found, clearly state this and suggest alternative approaches
 - Be conversational and maintain context across multiple questions
-- Remember what we've discussed in this conversation`;
+- When providing information from both sources, clearly distinguish between transcript and file information`;
+  }
 
   // 5. Prepare messages with conversation history
   const messages = [
     { role: "system", content: systemPrompt }
   ];
   
-  // Add recent conversation history to provide context
-  const recentMessages = conversationHistory.slice(-4); // Last 2 exchanges
+  const recentMessages = conversationHistory.slice(-4);
   messages.push(...recentMessages);
-  
-  // Add current user message
   messages.push({ role: "user", content: input });
 
   try {
     const aiReply = await getAIResponse(messages);
     return {
       response: aiReply,
-      searchResults: ragResults,
-      hasResults: ragResults.length > 0
+      searchResults: searchResults,
+      hasResults: searchResults.length > 0,
+      sourceInfo: sourceInfo
     };
   } catch (error) {
     console.error("AI response error:", error);
     return {
       response: "Sorry, I'm having trouble processing your request.",
       searchResults: [],
-      hasResults: false
+      hasResults: false,
+      sourceInfo: "Error"
     };
   }
+}
+
+// Helper function to analyze user's source intent
+function analyzeSourceIntent(query) {
+  const queryLower = query.toLowerCase();
+  
+  // Patterns for explicit transcript/meeting mentions (ENHANCED)
+  const transcriptPatterns = [
+    /\b(transcript|meeting transcript)\b/i,
+    /\b(what.*discussed.*(?:in|during).*meeting)\b/i,
+    /\b(what.*(?:is|was).*discussed.*(?:in|during).*meeting)\b/i,
+    /\b(meeting.*summary|meeting.*recap|summarize.*meeting)\b/i,
+    /\b(what.*happened.*(?:in|during).*meeting)\b/i,
+    /\b(meeting.*about|meeting.*discussion)\b/i,
+    /\b(from.*meeting|in.*meeting|during.*meeting)\b/i,
+    /\b(conversation|call|session)\b/i,
+    /\b(who.*said.*(?:in|during).*meeting)\b/i,
+    /\b(what.*(?:talked|mentioned|said).*(?:in|during).*meeting)\b/i,
+    /\b(action.*items?.*(?:from|in).*meeting)\b/i,
+    /\b(decisions?.*(?:made|from).*meeting)\b/i,
+    // Add more specific patterns
+    /^what.*discussed.*meeting$/i, // "what is discussed in the meeting"
+    /^what.*meeting.*about$/i,     // "what was the meeting about"
+    /^meeting.*discussion$/i,       // "meeting discussion"
+    /^give.*meeting.*summary$/i,    // "give me meeting summary"
+  ];
+  
+  // Patterns for explicit file/drive mentions
+  const filePatterns = [
+    /\b(file|files|document|documents|google drive)\b/i,
+    /\b(\.pdf|\.docx|\.txt|\.csv|\.pptx|\.doc)\b/i,
+    /\b(from.*file|in.*file|file.*contains|file.*says)\b/i,
+    /\b(drive.*folder|folder|uploaded|drive)\b/i,
+    /\b([a-zA-Z0-9_-]+\.(pdf|docx|txt|csv|pptx|doc))\b/i, // specific file names
+    /\b(what.*(?:in|inside).*file)\b/i,
+    /\b(show.*file|open.*file|read.*file)\b/i,
+  ];
+  
+  // Check for explicit mentions
+  const mentionsTranscript = transcriptPatterns.some(pattern => pattern.test(queryLower));
+  const mentionsFiles = filePatterns.some(pattern => pattern.test(queryLower));
+  
+  console.log(`🔍 Query analysis: "${queryLower}"`);
+  console.log(`📝 Mentions transcript: ${mentionsTranscript}`);
+  console.log(`📁 Mentions files: ${mentionsFiles}`);
+  
+  if (mentionsTranscript && !mentionsFiles) {
+    console.log(`✅ Classified as: transcript_only`);
+    return { type: 'transcript_only', confidence: 'high' };
+  } else if (mentionsFiles && !mentionsTranscript) {
+    console.log(`✅ Classified as: files_only`);
+    return { type: 'files_only', confidence: 'high' };
+  } else if (mentionsTranscript && mentionsFiles) {
+    console.log(`✅ Classified as: both_mentioned`);
+    return { type: 'both_mentioned', confidence: 'medium' };
+  } else {
+    console.log(`✅ Classified as: search_both (no explicit mention)`);
+    return { type: 'search_both', confidence: 'low' };
+  }
+}
+
+// Helper function to build document context (simplified)
+function buildDocumentContext(ragResults) {
+  let context = "RELEVANT DOCUMENTS:\n\n";
+  ragResults.forEach((result, index) => {
+    context += `Document ${index + 1}: ${result.filename}\n`;
+    context += `Relevance: ${result.similarity.toFixed(3)}\n`;
+    context += `Content: "${result.content}"\n\n`;
+  });
+  return context;
 }
 
   function highlightSearchTerms(text, searchTerms) {
@@ -1514,29 +1730,26 @@ async function loadChatHistory(uid, meetingId) {
   const q = query(chatRef, orderBy("timestamp", "asc"));
 
   try {
-    // Clear existing conversation history
     conversationHistory = [];
     
     const snapshot = await getDocs(q);
     snapshot.forEach(doc => {
       const { role, content } = doc.data();
       
-      // Rebuild conversation history from Firebase
       conversationHistory.push({ role, content });
       
-      // Create UI bubble
       const bubble = document.createElement("div");
       bubble.className = `chat-bubble ${role === "user" ? "user-bubble" : "ai-bubble"}`;
       bubble.innerHTML = linkify(content);
       chatMessages.appendChild(bubble);
     });
     
-    // Maintain conversation history size
     if (conversationHistory.length > MAX_CONVERSATION_HISTORY * 2) {
       conversationHistory = conversationHistory.slice(-MAX_CONVERSATION_HISTORY * 2);
     }
     
-    if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
+    // ✅ FIXED: Scroll after loading history
+    scrollToBottom(true);
     console.log(`📚 Loaded ${conversationHistory.length} messages into conversation context`);
   } catch (err) {
     console.error("❌ Failed to load chat history:", err);
@@ -1551,6 +1764,24 @@ async function loadChatHistory(uid, meetingId) {
   let userUid = null;
   let isProcessing = false;
   const filesContentMap = {};
+
+  function scrollToBottom(forceScroll = false) {
+  if (!chatMessages) return;
+  
+  // Use requestAnimationFrame to ensure DOM has updated
+  requestAnimationFrame(() => {
+    // Double RAF for better reliability with dynamic content
+    requestAnimationFrame(() => {
+      const isNearBottom = chatMessages.scrollTop + chatMessages.clientHeight >= chatMessages.scrollHeight - 50;
+      
+      // Always scroll for new messages, or if user was already near bottom
+      if (forceScroll || isNearBottom) {
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+        console.log(`📜 Scrolled to bottom: ${chatMessages.scrollHeight}`);
+      }
+    });
+  });
+}
 
   // Main chat interface initialization
   import('./enhanced-ai-helper.js').then(({ getAIResponse }) => {
@@ -1676,7 +1907,8 @@ async function preloadDriveFiles() {
       f.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
       f.mimeType === "application/pdf" ||
       f.mimeType === "text/csv" ||
-      f.mimeType === "application/vnd.google-apps.spreadsheet"
+      f.mimeType === "application/vnd.google-apps.spreadsheet" ||
+      f.mimeType === "application/vnd.openxmlformats-officedocument.presentationml.presentation" // ✅ PPTX support
     );
 
     console.log(`📂 Found ${supportedFiles.length} supported files in Drive`);
@@ -1724,6 +1956,7 @@ async function preloadDriveFiles() {
 }
 
 // Enhanced chat input handler with semantic search
+// Enhanced chat input handler with proper Drive file routing
 chatInput.addEventListener("keydown", async (e) => {
   if (e.key !== "Enter" || isProcessing) return;
   isProcessing = true;
@@ -1744,47 +1977,61 @@ chatInput.addEventListener("keydown", async (e) => {
   userBubble.className = "chat-bubble user-bubble";
   userBubble.textContent = input;
   chatMessages.appendChild(userBubble);
+  
+  // ✅ FIXED: Scroll after user message with force
+  scrollToBottom(true);
 
   // Add AI thinking bubble
   const aiBubble = document.createElement("div");
   aiBubble.className = "chat-bubble ai-bubble";
-  aiBubble.innerHTML = '<div class="typing-indicator">🔍 Searching knowledge base...</div>';
+  aiBubble.innerHTML = '<div class="typing-indicator">🔍 Processing your request...</div>';
   chatMessages.appendChild(aiBubble);
+  
+  // ✅ FIXED: Scroll after AI thinking bubble
+  scrollToBottom(true);
 
   try {
-    // Use RAG system with conversation context
-    const ragResponse = await getRAGResponseWithContext(input, selectedMeeting, userUid, filesContentMap, getAIResponse);
+    // ... your existing logic for handling different query types ...
     
-    // Add AI response to conversation history
-    conversationHistory.push({ role: "assistant", content: ragResponse.response });
-    
-    // Maintain conversation history size
-    if (conversationHistory.length > MAX_CONVERSATION_HISTORY * 2) {
-      conversationHistory = conversationHistory.slice(-MAX_CONVERSATION_HISTORY * 2);
-    }
-    
-    aiBubble.innerHTML = linkify(ragResponse.response);
-    
-    // Add context indicator
-    if (ragResponse.hasResults) {
-      const contextInfo = document.createElement("div");
-      contextInfo.style.cssText = "font-size: 0.8em; color: #666; margin-top: 8px; font-style: italic;";
-      contextInfo.innerHTML = `✨ Found ${ragResponse.searchResults.length} relevant documents`;
-      aiBubble.appendChild(contextInfo);
+    const intent = analyzeQuestionIntent(input);
+    console.log(`🎯 Detected intent: ${intent}`);
+
+    if (intent === 'drive_files' || isDriveFileListRequest(input)) {
+      await handleDriveFilesQuery(input, aiBubble);
+    } else if (intent === 'file_search' || intent === 'search_files') {
+      await handleFileSearchQuery(input, aiBubble);
+    } else {
+      aiBubble.innerHTML = '<div class="typing-indicator">🔍 Searching knowledge base...</div>';
+      const ragResponse = await getRAGResponseWithContext(input, selectedMeeting, userUid, filesContentMap, getAIResponse);
+      
+      conversationHistory.push({ role: "assistant", content: ragResponse.response });
+      
+      if (conversationHistory.length > MAX_CONVERSATION_HISTORY * 2) {
+        conversationHistory = conversationHistory.slice(-MAX_CONVERSATION_HISTORY * 2);
+      }
+      
+      aiBubble.innerHTML = linkify(ragResponse.response);
+      
+      if (ragResponse.hasResults) {
+        const contextInfo = document.createElement("div");
+        contextInfo.style.cssText = "font-size: 0.8em; color: #666; margin-top: 8px; font-style: italic;";
+        contextInfo.innerHTML = `✨ Found ${ragResponse.searchResults.length} relevant documents`;
+        aiBubble.appendChild(contextInfo);
+      }
+
+      if (voiceReplyToggle && voiceReplyToggle.checked && synth) {
+        console.log("🔊 Voice reply enabled, speaking response");
+        setTimeout(() => {
+          speakResponse(ragResponse.response || aiBubble.textContent);
+        }, 500);
+      }
     }
 
-    if (voiceReplyToggle && voiceReplyToggle.checked && synth) {
-      console.log("🔊 Voice reply enabled, speaking response");
-      setTimeout(() => {
-        // Use the response text from your AI response
-        speakResponse(ragResponse.response || aiBubble.textContent);
-      }, 500);
-    }
-
-    // Save to chat history in Firebase
+    // Save to chat history in Firebase (for all response types)
     if (userUid && selectedMeeting?.meetingId) {
+      const responseText = aiBubble.textContent || aiBubble.innerText;
       saveChatMessage(userUid, selectedMeeting.meetingId, "user", input);
-      saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", ragResponse.response);
+      saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", responseText);
     }
 
   } catch (error) {
@@ -1793,82 +2040,164 @@ chatInput.addEventListener("keydown", async (e) => {
   }
 
   isProcessing = false;
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  
+  // ✅ FIXED: Final scroll after everything is complete
+  scrollToBottom(true);
 });
 
-    // Enhanced drive files query handler with better error handling
-    async function handleDriveFilesQuery(input, aiBubble) {
-      const folderId = extractFolderId(selectedMeeting.driveFolderLink);
-      if (!folderId) {
-        aiBubble.innerHTML = "⚠️ Could not extract folder ID from Drive link. Please check the folder link format.";
-        return;
-      }
 
-      try {
-        aiBubble.innerHTML = '<div class="typing-indicator">📁 Accessing Drive folder...</div>';
-        
-        const token = await getAuthToken();
-        
-        // Force refresh to get current state
-        const files = await getFreshFileList(folderId, token, true);
+function isDriveFileListRequest(query) {
+  const queryLower = query.toLowerCase().trim();
+  
+  // More comprehensive patterns for Drive file requests
+  const driveFilePatterns = [
+    // Direct file listing requests
+    /^(show|list|display|give me).*files?$/i,
+    /^(show|list|display|give me).*documents?$/i,
+    /^(show|list|display|give me).*drive.*files?$/i,
+    /^what.*files?.*(do|are).*in.*(drive|folder)$/i,
+    /^what.*documents?.*(do|are).*in.*(drive|folder)$/i,
+    
+    // More natural language patterns
+    /\b(show|give|list|display|find|what).*\b(files?|documents?|drive)\b/i,
+    /\bfiles? in\b.*\b(drive|folder)\b/i,
+    /\bwhat.*inside.*drive\b/i,
+    /\blist.*documents?\b/i,
+    /\bshow.*folder\b/i,
+    /\bdrive folder.*contents?\b/i,
+    /\ball.*files?\b/i,
+    /\bavailable.*files?\b/i,
+    /\bfiles?.*uploaded\b/i,
+    /\bfiles?.*available\b/i,
+    
+    // Question patterns
+    /^what files/i,
+    /^which files/i,
+    /^any files/i,
+    /^all files/i,
+    /files in drive/i,
+    /documents in folder/i
+  ];
+  
+  const isDriveRequest = driveFilePatterns.some(pattern => pattern.test(queryLower));
+  console.log(`🔍 Drive file request check: "${queryLower}" -> ${isDriveRequest}`);
+  
+  return isDriveRequest;
+}
 
-        if (files.length === 0) {
-          aiBubble.innerHTML = `📂 Your Drive folder appears to be empty or contains no accessible files.<br><br>
-            <a href="${selectedMeeting.driveFolderLink}" target="_blank" rel="noopener noreferrer">Open folder in Drive</a> to verify.`;
-          return;
-        }
 
-        // Group files by type
-        const filesByType = {};
-        files.forEach(file => {
-          const type = getFileTypeCategory(file.mimeType);
-          if (!filesByType[type]) filesByType[type] = [];
-          filesByType[type].push(file);
-        });
 
-        let response = `📁 **Found ${files.length} files in your Drive folder:**<br><br>`;
-        
-        for (const [type, typeFiles] of Object.entries(filesByType)) {
-          response += `<strong>${type} (${typeFiles.length}):</strong><br>`;
-          typeFiles.forEach(file => {
-            const sizeDisplay = file.displaySize || 'Unknown size';
-            const modifiedDate = file.modifiedTime ? 
-              new Date(file.modifiedTime).toLocaleDateString() : '';
-            const dateStr = modifiedDate ? ` • Modified: ${modifiedDate}` : '';
-            
-            response += `• <a href="${file.webViewLink}" target="_blank" rel="noopener noreferrer">${file.name}</a> (${sizeDisplay}${dateStr})<br>`;
-          });
-          response += '<br>';
-        }
+// Enhanced handleDriveFilesQuery function with proper error handling and fresh data
+async function handleDriveFilesQuery(input, aiBubble) {
+  console.log("📁 Handling Drive files query:", input);
+  
+  if (!selectedMeeting?.driveFolderLink) {
+    aiBubble.innerHTML = "⚠️ No Drive folder linked to this meeting. Please add a Drive folder link in the meeting settings.";
+    return;
+  }
 
-        response += `<small>🔄 <em>Data refreshed at ${new Date().toLocaleTimeString()}</em></small>`;
+  const folderId = extractFolderId(selectedMeeting.driveFolderLink);
+  if (!folderId) {
+    aiBubble.innerHTML = "⚠️ Could not extract folder ID from Drive link. Please check the folder link format.";
+    return;
+  }
 
-        aiBubble.innerHTML = response;
+  try {
+    aiBubble.innerHTML = '<div class="typing-indicator">📁 Accessing your Drive folder (checking for new files)...</div>';
+    
+    // Get fresh auth token
+    const token = await getAuthToken();
+    console.log("✅ Got auth token");
+    
+    // ALWAYS force refresh to check for new files
+    console.log("🔄 Force refreshing Drive folder to check for new files...");
+    const files = await getFreshFileList(folderId, token, true); // Force refresh = true
+    
+    console.log(`📂 Found ${files.length} total files`);
 
-        if (userUid && selectedMeeting.meetingId) {
-          const plainResponse = aiBubble.textContent || aiBubble.innerText;
-          saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", plainResponse);
-        }
-
-      } catch (err) {
-        console.error("Drive API error:", err);
-        if (err && err.status === 403) {
-          aiBubble.innerHTML = `⚠️ Access denied to the Drive folder.<br><br>
-            This could mean:<br>
-            • You don't have permission to view this folder<br>
-            • The folder has been moved or deleted<br>
-            • The sharing settings have changed<br><br>
-            <a href="${selectedMeeting.driveFolderLink}" target="_blank" rel="noopener noreferrer">Try accessing the folder directly</a>`;
-        } else {
-          aiBubble.innerHTML = `❌ Error accessing Google Drive: ${err.message}<br><br>
-            Please try:<br>
-            • Refreshing your browser<br>
-            • Re-authorizing the extension<br>
-            • Checking your internet connection<br><br>
-            <a href="${selectedMeeting.driveFolderLink}" target="_blank" rel="noopener noreferrer">Open folder in Drive</a>`;
-        }
-      }
+    if (files.length === 0) {
+      aiBubble.innerHTML = `📂 Your Drive folder appears to be empty or contains no accessible files.<br><br>
+        <strong>Folder:</strong> <a href="${selectedMeeting.driveFolderLink}" target="_blank" rel="noopener noreferrer">Open in Google Drive</a><br><br>
+        <em>If you just added files, they should appear now. If not, please check folder permissions.</em>`;
+      return;
     }
+
+    // Group files by type for better organization
+    const filesByType = {};
+    files.forEach(file => {
+      const type = getFileTypeCategory(file.mimeType);
+      if (!filesByType[type]) filesByType[type] = [];
+      filesByType[type].push(file);
+    });
+
+    // Build comprehensive response
+    let response = `📁 <strong>Your Drive Folder Contents (${files.length} files)</strong><br><br>`;
+    
+    // Add timestamp to show freshness
+    response += `<small>🕐 <em>Refreshed: ${new Date().toLocaleString()}</em></small><br><br>`;
+    
+    // List files by category
+    for (const [type, typeFiles] of Object.entries(filesByType)) {
+      response += `<strong>${type} (${typeFiles.length}):</strong><br>`;
+      
+      typeFiles.forEach((file, index) => {
+        const sizeDisplay = file.displaySize || 'Unknown size';
+        const modifiedDate = file.modifiedTime ? 
+          new Date(file.modifiedTime).toLocaleDateString() : '';
+        const dateStr = modifiedDate ? ` • Modified: ${modifiedDate}` : '';
+        
+        response += `${index + 1}. <a href="${file.webViewLink}" target="_blank" rel="noopener noreferrer">${file.name}</a> <small>(${sizeDisplay}${dateStr})</small><br>`;
+      });
+      response += '<br>';
+    }
+
+    // Add helpful footer
+    response += `<hr style="margin: 15px 0; border: none; border-top: 1px solid #eee;">`;
+    response += `<small>💡 <strong>Tip:</strong> You can ask me about specific files or search within their content!</small><br>`;
+    response += `<small>🔗 <a href="${selectedMeeting.driveFolderLink}" target="_blank" rel="noopener noreferrer">Open folder in Google Drive</a></small>`;
+
+    aiBubble.innerHTML = response;
+    console.log("✅ Successfully displayed Drive files");
+    scrollToBottom(true);
+
+  } catch (err) {
+    console.error("Drive API error:", err);
+    
+    let errorResponse = "";
+    if (err && (err.status === 403 || err.message.includes('403'))) {
+      errorResponse = `⚠️ <strong>Access Denied to Drive Folder</strong><br><br>
+        This could mean:<br>
+        • You don't have permission to view this folder<br>
+        • The folder has been moved or deleted<br>
+        • The sharing settings have changed<br>
+        • Your authentication has expired<br><br>
+        <strong>Try these solutions:</strong><br>
+        1. <a href="${selectedMeeting.driveFolderLink}" target="_blank" rel="noopener noreferrer">Open the folder directly in Google Drive</a><br>
+        2. Refresh this page to re-authenticate<br>
+        3. Check that the folder is shared with your account<br><br>
+        <small><em>Error: ${err.message}</em></small>`;
+    } else if (err && (err.status === 404 || err.message.includes('404'))) {
+      errorResponse = `⚠️ <strong>Drive Folder Not Found</strong><br><br>
+        The linked Drive folder could not be found.<br><br>
+        Possible reasons:<br>
+        • The folder was deleted or moved<br>
+        • The folder ID in the link is incorrect<br>
+        • You don't have access to this folder<br><br>
+        <a href="${selectedMeeting.driveFolderLink}" target="_blank" rel="noopener noreferrer">Try opening the folder link</a>`;
+    } else {
+      errorResponse = `❌ <strong>Error Accessing Google Drive</strong><br><br>
+        <strong>Error:</strong> ${err.message}<br><br>
+        <strong>Please try:</strong><br>
+        • Refreshing your browser<br>
+        • Re-authorizing the extension<br>
+        • Checking your internet connection<br><br>
+        <a href="${selectedMeeting.driveFolderLink}" target="_blank" rel="noopener noreferrer">Open folder in Google Drive</a>`;
+    }
+    
+    aiBubble.innerHTML = errorResponse;
+    scrollToBottom(true);
+  }
+}
 
     // Handle file search queries
     async function handleFileSearchQuery(input, aiBubble) {

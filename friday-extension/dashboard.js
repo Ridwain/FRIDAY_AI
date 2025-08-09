@@ -8,6 +8,104 @@ const meetingsDiv = document.getElementById("meetings");
 const logoutBtn = document.getElementById("logoutBtn");
 const transcriptionBtn = document.getElementById("transcriptionBtn");
 
+// Real‑time transcript embedding and upsert helpers
+const REALTIME_PINECONE_URL = 'http://localhost:3000/upsert';
+const OPENAI_KEY = '';
+
+async function generateRealtimeEmbedding(text) {
+  try {
+    if (!text || text.trim().length < 10) {
+      console.log('⏭️ Text too short for embedding, skipping');
+      return null;
+    }
+
+    const input = text.length > 8000 ? text.slice(-8000) : text;
+    console.log(`🔄 Generating embedding for text: "${input.substring(0, 100)}..."`);
+
+    const response = await fetch('https://api.openai.com/v1/embeddings', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_KEY}`
+      },
+      body: JSON.stringify({
+        input,
+        model: 'text-embedding-3-small',
+        dimensions: 1024
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`OpenAI API error: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    console.log('✅ Successfully generated embedding');
+    return data.data[0].embedding;
+  } catch (err) {
+    console.error('❌ generateRealtimeEmbedding error:', err);
+    return null;
+  }
+}
+
+// Improved function to upsert transcript to Pinecone
+async function upsertRealtimeTranscript(meetingId, transcript) {
+  try {
+    if (!transcript || transcript.trim().length < 20) {
+      console.log('⏭️ Transcript too short for Pinecone upload, skipping');
+      return;
+    }
+
+    console.log(`🚀 Starting Pinecone upload for meeting ${meetingId}`);
+    console.log(`📝 Transcript length: ${transcript.length} characters`);
+
+    const embedding = await generateRealtimeEmbedding(transcript);
+    if (!embedding) {
+      console.error('❌ Failed to generate embedding, skipping Pinecone upload');
+      return;
+    }
+
+    const vector = {
+      id: `${meetingId}_realtime`,
+      values: embedding,
+      metadata: {
+        meetingId: meetingId,
+        content: transcript.slice(-1000), // Last 1000 characters for metadata
+        type: 'meeting_transcript',
+        updatedAt: new Date().toISOString(),
+        wordCount: transcript.trim().split(/\s+/).length
+      }
+    };
+
+    console.log(`📤 Uploading to Pinecone namespace: ${meetingId}`);
+    
+    const response = await fetch(REALTIME_PINECONE_URL, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        namespace: meetingId,
+        vectors: [vector]
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Pinecone upsert failed: ${response.status} - ${errorText}`);
+    }
+
+    const result = await response.json();
+    console.log(`✅ Successfully uploaded transcript to Pinecone namespace: ${meetingId}`);
+    console.log(`📊 Upserted count: ${result.upsertedCount || 1}`);
+
+  } catch (err) {
+    console.error('❌ upsertRealtimeTranscript error:', err);
+    // Don't throw error - let transcript saving continue even if Pinecone fails
+  }
+}
+
 let selectedMeeting = null;
 let isTranscribing = false;
 
@@ -73,7 +171,7 @@ async function initializeTranscriptDocument(uid, meetingId, docId, startTime, st
   }
 }
 
-// Function to update transcript document in real-time
+// FIXED: Function to update transcript document in real-time with Pinecone upload
 async function updateTranscriptDocument(uid, meetingId, docId, transcript, lastUpdated, status) {
   try {
     const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
@@ -87,6 +185,11 @@ async function updateTranscriptDocument(uid, meetingId, docId, transcript, lastU
     }, { merge: true });
     
     console.log(`Updated transcript document: ${docId} (${transcript.length} chars)`);
+    
+    // 🔥 FIXED: Now properly upload to Pinecone with better error handling
+    console.log(`🔄 Attempting Pinecone upload for meeting: ${meetingId}`);
+    await upsertRealtimeTranscript(meetingId, transcript);
+    
   } catch (error) {
     console.error("Error updating transcript document:", error);
     // Fallback to chrome.storage
@@ -98,7 +201,7 @@ async function updateTranscriptDocument(uid, meetingId, docId, transcript, lastU
   }
 }
 
-// Function to finalize transcript document
+// Function to finalize transcript document with final Pinecone upload
 async function finalizeTranscriptDocument(uid, meetingId, docId, transcript, endTime, wordCount, status) {
   try {
     const transcriptDocRef = doc(db, "users", uid, "meetings", meetingId, "transcripts", docId);
@@ -113,6 +216,11 @@ async function finalizeTranscriptDocument(uid, meetingId, docId, transcript, end
     }, { merge: true });
     
     console.log(`Finalized transcript document: ${docId} (${wordCount} words)`);
+    
+    // 🔥 FIXED: Final upload to Pinecone with complete transcript
+    console.log(`🏁 Final Pinecone upload for meeting: ${meetingId}`);
+    await upsertRealtimeTranscript(meetingId, transcript);
+    
   } catch (error) {
     console.error("Error finalizing transcript document:", error);
     // Fallback to chrome.storage
