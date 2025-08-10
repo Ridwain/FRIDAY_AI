@@ -346,7 +346,7 @@ document.addEventListener("DOMContentLoaded", () => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': ``
+        'Authorization': `Bearer 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`
       },
       body: JSON.stringify({
         input: text.substring(0, 8000),
@@ -712,30 +712,43 @@ function createSimpleChunks(content, filename) {
       
       const searchResults = [];
       const queryLower = query.toLowerCase();
-      const queryWords = queryLower.split(/\s+/).filter(word => word.length > 2);
+      let queryWords = queryLower.split(/\s+/).filter(word => word.length > 2);
+      // Expand query words with synonyms to improve keyword matching
+      queryWords = expandQueryWords(queryWords);
       
       snapshot.forEach(doc => {
         const data = doc.data();
         const transcript = data.transcript || data.content || "";
         const transcriptLower = transcript.toLowerCase();
-        
+
         let score = 0;
         let matchedPhrases = [];
-        
+
+        // Exact and partial keyword matches contribute to the base score
         if (transcriptLower.includes(queryLower)) {
           score += 10;
           matchedPhrases.push(queryLower);
         }
-        
+
         queryWords.forEach(word => {
           const wordCount = (transcriptLower.match(new RegExp(word, 'g')) || []).length;
           score += wordCount * 2;
           if (wordCount > 0) matchedPhrases.push(word);
         });
-        
-        if (score > 0) {
+
+        // Compute fuzzy similarity between the query and the first part of the transcript
+        const fuzzySim = fuzzySimilarity(queryLower, transcriptLower.substring(0, 1000));
+        // Add fuzzy similarity to the score (scaled). Higher similarity increases score.
+        score += fuzzySim * 5;
+
+        // Apply recency weighting: newer transcripts get a boost
+        const recencyWeight = computeRecencyWeight(data.lastUpdated || data.startTime || data.timestamp);
+        score *= recencyWeight;
+
+        // Include transcripts if they have a positive score or sufficiently high fuzzy similarity
+        if (score > 0 || fuzzySim >= 0.6) {
           const contexts = extractRelevantContexts(transcript, queryWords, queryLower);
-          
+
           searchResults.push({
             docId: doc.id,
             score: score,
@@ -811,6 +824,91 @@ function createSimpleChunks(content, filename) {
           : context.text
       }));
   }
+
+// =============================
+// Additional helper functions for enhanced search
+//
+// Levenshtein distance computes the minimum number of single-character edits
+// (insertions, deletions or substitutions) required to change one word into another.
+// This implementation is adapted for small strings and returns the distance as a
+// non‑negative integer. A zero distance means the strings are identical. For
+// performance reasons, we do not implement the full dynamic programming table for very
+// long strings. This helper will be used to compute fuzzy similarity between
+// queries and content, enabling typo‑tolerant search and approximate matching.
+function levenshteinDistance(a = '', b = '') {
+  const m = a.length;
+  const n = b.length;
+  // If one of the strings is empty, distance is the length of the other
+  if (m === 0) return n;
+  if (n === 0) return m;
+  // Initialize DP table
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,      // deletion
+        dp[i][j - 1] + 1,      // insertion
+        dp[i - 1][j - 1] + cost // substitution
+      );
+    }
+  }
+  return dp[m][n];
+}
+
+// Fuzzy similarity returns a number between 0 and 1 that quantifies how similar
+// two strings are. It uses the Levenshtein distance normalized by the length of
+// the longer string. A result closer to 1 indicates higher similarity.
+function fuzzySimilarity(a = '', b = '') {
+  const lenA = a.length;
+  const lenB = b.length;
+  if (lenA === 0 && lenB === 0) return 1;
+  const distance = levenshteinDistance(a.toLowerCase(), b.toLowerCase());
+  const maxLen = Math.max(lenA, lenB);
+  return maxLen === 0 ? 1 : 1 - distance / maxLen;
+}
+
+// Compute a recency weight for a given timestamp. Newer timestamps receive a
+// higher weight, and the weight decays exponentially over time (measured in days).
+// If the timestamp is invalid or missing, the weight defaults to 1 (neutral).
+function computeRecencyWeight(timestamp) {
+  if (!timestamp) return 1;
+  const now = Date.now();
+  const timeValue = new Date(timestamp).getTime();
+  if (isNaN(timeValue)) return 1;
+  const ageDays = Math.max(0, (now - timeValue) / (1000 * 60 * 60 * 24));
+  // Exponential decay: weight decreases as age increases. A decay constant of 30
+  // yields ~37% reduction every 30 days.
+  const decay = Math.exp(-ageDays / 30);
+  return 1 + decay;
+}
+
+// A simple static synonyms map to expand query terms. These mappings allow the
+// search functions to capture related concepts without requiring external APIs.
+// Feel free to extend this dictionary with domain‑specific terms.
+const SYNONYMS_MAP = {
+  meeting: ['session', 'gathering', 'conference', 'call'],
+  project: ['assignment', 'task', 'initiative', 'plan'],
+  document: ['file', 'paper', 'note', 'report'],
+  deadline: ['due', 'cutoff', 'timeframe'],
+  discussion: ['conversation', 'dialogue', 'talk']
+};
+
+// Expand an array of query words by adding synonyms defined in SYNONYMS_MAP. The
+// returned array is deduplicated so that each term appears only once. This helps
+// the keyword search portion of the algorithm match more relevant content.
+function expandQueryWords(words) {
+  const expanded = new Set(words);
+  words.forEach(word => {
+    const synonyms = SYNONYMS_MAP[word];
+    if (synonyms && Array.isArray(synonyms)) {
+      synonyms.forEach(syn => expanded.add(syn));
+    }
+  });
+  return Array.from(expanded);
+}
 
   function cleanTextForSpeech(text) {
     return text
@@ -1617,6 +1715,9 @@ function buildDocumentContext(ragResults) {
   // Enhanced search function with better filtering
   async function searchFilesRecursively(folderId, queryText, token) {
     const matches = [];
+    // Normalize query text once for reuse. If queryText is empty or undefined,
+    // queryLower will be an empty string. We use this for fuzzy matching below.
+    const queryLower = (queryText || '').trim().toLowerCase();
 
     async function searchFolder(folderId, path = "") {
       try {
@@ -1658,16 +1759,34 @@ function buildDocumentContext(ragResults) {
         for (const file of data.files) {
           // Skip trashed files (double check)
           if (file.trashed === true) continue;
-
           const fullPath = path ? `${path}/${file.name}` : file.name;
-          
-          // Add matched file
-          matches.push({
-            ...file,
-            path: fullPath,
-            displaySize: file.size ? formatFileSize(parseInt(file.size)) : 'Unknown size'
-          });
-          
+
+          // Decide whether to include this file based on fuzzy match with its name.
+          let includeFile = true;
+          let fuzzySim = 0;
+          if (queryLower) {
+            const nameLower = file.name.toLowerCase();
+            fuzzySim = fuzzySimilarity(queryLower, nameLower);
+            // Only include the file if it either contains the query substring or
+            // has a sufficiently high fuzzy similarity. This allows approximate
+            // matches and typo tolerance while filtering out unrelated results.
+            if (!nameLower.includes(queryLower) && fuzzySim < 0.6) {
+              includeFile = false;
+            }
+          }
+
+          if (includeFile) {
+            // Compute recency weight based on the file's modifiedTime to favor recent documents
+            const recencyWeight = computeRecencyWeight(file.modifiedTime);
+            matches.push({
+              ...file,
+              path: fullPath,
+              displaySize: file.size ? formatFileSize(parseInt(file.size)) : 'Unknown size',
+              similarity: fuzzySim,
+              recencyWeight: recencyWeight
+            });
+          }
+
           // If it's a folder, search recursively
           if (file.mimeType === "application/vnd.google-apps.folder") {
             await searchFolder(file.id, fullPath);
@@ -1683,6 +1802,15 @@ function buildDocumentContext(ragResults) {
 
     await searchFolder(folderId);
     console.log(`🔍 Total search results: ${matches.length}`);
+    // Sort results by a combination of fuzzy similarity and recency weight if available.
+    // Files that have both a high fuzzy similarity and recent modification date will
+    // appear earlier in the list. If these properties are not present, they
+    // default to zero/one and will not affect ordering significantly.
+    matches.sort((a, b) => {
+      const scoreA = (a.similarity || 0) * (a.recencyWeight || 1);
+      const scoreB = (b.similarity || 0) * (b.recencyWeight || 1);
+      return scoreB - scoreA;
+    });
     return matches;
   }
 

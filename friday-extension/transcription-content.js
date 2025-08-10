@@ -38,7 +38,8 @@
     lastActivity: Date.now(),
     restartTimeout: null,
     noSpeechTimeout: null,
-    isRestarting: false
+    isRestarting: false,
+    isStopping: false // 🔥 NEW: Flag to prevent interference during stop
   };
 
   // Logging utility
@@ -97,7 +98,8 @@
         lastSaveTime: 0,
         language,
         lastActivity: Date.now(),
-        isRestarting: false
+        isRestarting: false,
+        isStopping: false // 🔥 Reset stopping flag
       });
 
       // Clean up previous recognition if exists
@@ -143,7 +145,10 @@
       // Set up no-speech timeout
       clearTimeout(transcriptionState.noSpeechTimeout);
       transcriptionState.noSpeechTimeout = setTimeout(() => {
-        if (transcriptionState.isActive && Date.now() - transcriptionState.lastActivity > CONFIG.NO_SPEECH_TIMEOUT) {
+        // 🔥 FIX: Check if we're not stopping before restarting
+        if (transcriptionState.isActive && 
+            !transcriptionState.isStopping && 
+            Date.now() - transcriptionState.lastActivity > CONFIG.NO_SPEECH_TIMEOUT) {
           logger.warn("No speech detected for extended period, restarting...");
           restartRecognition();
         }
@@ -151,6 +156,11 @@
     };
 
     recognition.onresult = (event) => {
+      // 🔥 FIX: Don't process results if we're stopping
+      if (transcriptionState.isStopping) {
+        return;
+      }
+
       transcriptionState.lastActivity = Date.now();
       let interimTranscript = "";
       let finalTranscript = "";
@@ -175,7 +185,10 @@
       // Reset no-speech timeout
       clearTimeout(transcriptionState.noSpeechTimeout);
       transcriptionState.noSpeechTimeout = setTimeout(() => {
-        if (transcriptionState.isActive && Date.now() - transcriptionState.lastActivity > CONFIG.NO_SPEECH_TIMEOUT) {
+        // 🔥 FIX: Check if we're not stopping before restarting
+        if (transcriptionState.isActive && 
+            !transcriptionState.isStopping && 
+            Date.now() - transcriptionState.lastActivity > CONFIG.NO_SPEECH_TIMEOUT) {
           logger.warn("No speech detected for extended period, restarting...");
           restartRecognition();
         }
@@ -183,6 +196,12 @@
     };
 
     recognition.onerror = (event) => {
+      // 🔥 FIX: Don't handle errors if we're stopping
+      if (transcriptionState.isStopping) {
+        logger.info("Ignoring error during stop process:", event.error);
+        return;
+      }
+
       logger.error("Speech recognition error:", event.error);
       clearTimeout(transcriptionState.noSpeechTimeout);
 
@@ -211,8 +230,8 @@
           
         case 'aborted':
           logger.info("Speech recognition was aborted");
-          // Don't restart if aborted intentionally
-          if (transcriptionState.isActive && !transcriptionState.isRestarting) {
+          // Don't restart if aborted intentionally (likely during stop)
+          if (transcriptionState.isActive && !transcriptionState.isRestarting && !transcriptionState.isStopping) {
             logger.warn("Unexpected abort, restarting...");
             restartRecognition();
           }
@@ -243,7 +262,8 @@
       logger.info("Speech recognition ended");
       clearTimeout(transcriptionState.noSpeechTimeout);
       
-      if (transcriptionState.isActive && !transcriptionState.isRestarting) {
+      // 🔥 FIX: Don't restart if we're stopping
+      if (transcriptionState.isActive && !transcriptionState.isRestarting && !transcriptionState.isStopping) {
         logger.info("Unexpected end, restarting...");
         restartRecognition();
       }
@@ -254,7 +274,9 @@
    * Restarts speech recognition with exponential backoff
    */
   function restartRecognition() {
-    if (!transcriptionState.isActive || transcriptionState.isRestarting) {
+    // 🔥 FIX: Don't restart if we're stopping
+    if (!transcriptionState.isActive || transcriptionState.isRestarting || transcriptionState.isStopping) {
+      logger.info("Skipping restart - stopping or already restarting");
       return;
     }
 
@@ -290,7 +312,8 @@
     updateTranscriptionIndicator(`Restarting in ${Math.ceil(delay/1000)}s...`);
 
     transcriptionState.restartTimeout = setTimeout(() => {
-      if (transcriptionState.isActive) {
+      // 🔥 FIX: Double-check we're not stopping before restarting
+      if (transcriptionState.isActive && !transcriptionState.isStopping) {
         logger.info("Restarting speech recognition...");
         try {
           startTranscription(
@@ -303,6 +326,8 @@
           sendErrorMessage(`Failed to restart transcription: ${error.message}`);
           stopTranscription();
         }
+      } else {
+        logger.info("Skipping restart due to stop request");
       }
     }, delay);
   }
@@ -316,26 +341,67 @@
     }
 
     try {
+      // 🔥 FIX: Set stopping flag FIRST to prevent interference
+      transcriptionState.isStopping = true;
+      logger.info("Starting transcription stop process...");
+
+      // 🔥 FIX: Clear ALL timeouts immediately
+      if (transcriptionState.restartTimeout) {
+        clearTimeout(transcriptionState.restartTimeout);
+        transcriptionState.restartTimeout = null;
+      }
+      if (transcriptionState.noSpeechTimeout) {
+        clearTimeout(transcriptionState.noSpeechTimeout);
+        transcriptionState.noSpeechTimeout = null;
+      }
+
+      // 🔥 FIX: Finalize transcript BEFORE stopping recognition
+      if (transcriptionState.accumulatedTranscript.trim()) {
+        logger.info("Finalizing transcript before stop...");
+        finalizeTranscriptDocument();
+        
+        // 🔥 FIX: Give a moment for the message to be sent
+        setTimeout(() => {
+          completeStopProcess();
+        }, 100);
+      } else {
+        completeStopProcess();
+      }
+
+    } catch (error) {
+      logger.error("Error stopping transcription:", error);
+      // Still complete the stop process even if there's an error
+      completeStopProcess();
+    }
+  }
+
+  /**
+   * 🔥 NEW: Complete the stop process after transcript is finalized
+   */
+  function completeStopProcess() {
+    try {
+      logger.info("Completing stop process...");
+      
       transcriptionState.isActive = false;
       transcriptionState.isRestarting = false;
-
-      // Clear all timeouts
-      clearTimeout(transcriptionState.restartTimeout);
-      clearTimeout(transcriptionState.noSpeechTimeout);
 
       if (transcriptionState.recognition) {
         transcriptionState.recognition.stop();
         transcriptionState.recognition = null;
       }
 
-      if (transcriptionState.accumulatedTranscript.trim()) {
-        finalizeTranscriptDocument();
-      }
-
       removeTranscriptionIndicator();
-      logger.info("Transcription stopped");
+      
+      // 🔥 FIX: Reset stopping flag at the very end
+      transcriptionState.isStopping = false;
+      
+      logger.info("Transcription stopped successfully");
     } catch (error) {
-      logger.error("Error stopping transcription:", error);
+      logger.error("Error in complete stop process:", error);
+      // Reset flags even if there's an error
+      transcriptionState.isActive = false;
+      transcriptionState.isRestarting = false;
+      transcriptionState.isStopping = false;
     }
   }
 
@@ -388,6 +454,7 @@
    */
   function finalizeTranscriptDocument() {
     try {
+      logger.info(`Finalizing transcript: ${transcriptionState.accumulatedTranscript.length} characters`);
       chrome.runtime.sendMessage({
         type: "FINALIZE_TRANSCRIPT",
         uid: transcriptionState.uid,
@@ -397,6 +464,7 @@
         wordCount: transcriptionState.accumulatedTranscript.trim().split(/\s+/).length,
         language: transcriptionState.language
       });
+      logger.info("Finalization message sent");
     } catch (error) {
       logger.error("Failed to finalize transcript:", error);
     }
@@ -425,8 +493,10 @@
         ? text.substring(0, CONFIG.MAX_TEXT_LENGTH) + '...' 
         : text;
       
-      const statusIcon = transcriptionState.isRestarting ? '🔄' : '🎙️';
-      const statusText = transcriptionState.isRestarting ? 'Restarting...' : 'Recording...';
+      const statusIcon = transcriptionState.isRestarting ? '🔄' : 
+                        transcriptionState.isStopping ? '🛑' : '🎙️';
+      const statusText = transcriptionState.isRestarting ? 'Restarting...' : 
+                        transcriptionState.isStopping ? 'Stopping...' : 'Recording...';
       
       indicator.innerHTML = `${statusIcon} ${statusText}<br><small style="opacity: 0.8;">${truncatedText}</small>`;
     }
@@ -461,9 +531,14 @@
    * Cleans up resources
    */
   function cleanup() {
-    stopTranscription();
+    // 🔥 FIX: Use the proper stop function
+    if (transcriptionState.isActive) {
+      stopTranscription();
+    }
+    
     clearTimeout(transcriptionState.restartTimeout);
     clearTimeout(transcriptionState.noSpeechTimeout);
+    
     transcriptionState = {
       recognition: null,
       isActive: false,
@@ -476,7 +551,8 @@
       lastActivity: Date.now(),
       restartTimeout: null,
       noSpeechTimeout: null,
-      isRestarting: false
+      isRestarting: false,
+      isStopping: false
     };
   }
 

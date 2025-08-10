@@ -50,6 +50,7 @@ async function generateRealtimeEmbedding(text) {
 }
 
 // Improved function to upsert transcript to Pinecone
+// Improved function to upsert transcript to Pinecone with a unique ID
 async function upsertRealtimeTranscript(meetingId, transcript) {
   try {
     if (!transcript || transcript.trim().length < 20) {
@@ -66,8 +67,11 @@ async function upsertRealtimeTranscript(meetingId, transcript) {
       return;
     }
 
+    // Create a unique ID based on meetingId and current timestamp
+    const uniqueId = `${meetingId}_realtime_${Date.now()}`;
+
     const vector = {
-      id: `${meetingId}_realtime`,
+      id: uniqueId, // Ensure unique ID here
       values: embedding,
       metadata: {
         meetingId: meetingId,
@@ -102,9 +106,9 @@ async function upsertRealtimeTranscript(meetingId, transcript) {
 
   } catch (err) {
     console.error('❌ upsertRealtimeTranscript error:', err);
-    // Don't throw error - let transcript saving continue even if Pinecone fails
   }
 }
+
 
 let selectedMeeting = null;
 let isTranscribing = false;
