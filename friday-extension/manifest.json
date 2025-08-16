@@ -31,7 +31,8 @@
     "https://*.zoom.us/*",
     "https://*.zoom.com/*",
     "https://api.openai.com/",
-    "https://api.openai.com/*"
+    "https://api.openai.com/*",
+    "http://localhost:3000/*"
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self';"

@@ -1,5 +1,15 @@
 import { db } from './firebase-config.js';
 import { collection, addDoc, serverTimestamp, query, orderBy, getDocs, getDoc, doc, setDoc, updateDoc } from './firebase/firebase-firestore.js';
+import {
+  initWebScraper,
+  isUrlLike,
+  scrapeUrl,
+  scrapeAndUpsert,
+  serpSearch,
+  detectWebSearchyQuery,
+  indexUrlsFromFiles,
+  buildMessagesForUrlQA
+} from './web-scraper.js'; // <-- if your file is named web-scrapper.js, change this path accordingly
 
 
 const RAG_CONFIG = {
@@ -43,6 +53,13 @@ function normalizeFilename(name) {
 
 document.addEventListener("DOMContentLoaded", () => {
   // Initialize Speech Recognition
+  (async () => {
+    try {
+      await initWebScraper();
+    } catch (e) {
+      console.warn('web-scraper init failed (non-fatal):', e);
+    }
+  })();
   function initSpeechRecognition() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   
@@ -346,7 +363,7 @@ document.addEventListener("DOMContentLoaded", () => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer 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`
+        'Authorization': ``
       },
       body: JSON.stringify({
         input: text.substring(0, 8000),
@@ -387,7 +404,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   
 
-  async function uploadChunksToPinecone(chunks, filename) {
+async function uploadChunksToPinecone(chunks, filename) {
   try {
     if (!chunks || chunks.length === 0) {
       console.warn('No chunks to upload for', filename);
@@ -396,47 +413,42 @@ document.addEventListener("DOMContentLoaded", () => {
 
     console.log(`📤 Uploading ${chunks.length} chunks from ${filename} to Pinecone...`);
 
-    // Prepare vectors in Pinecone format
     const vectors = chunks.map(chunk => ({
       id: chunk.id,
       values: chunk.embedding,
       metadata: {
         filename: chunk.filename,
         chunkIndex: chunk.chunkIndex,
-        content: chunk.content.substring(0, 1000), // Limit content size
+        content: chunk.content.substring(0, 1000),
         wordCount: chunk.content.split(/\s+/).length,
         uploadedAt: new Date().toISOString()
       }
     }));
 
-    // Upload to Pinecone via your server
-    const response = await fetch(`${EMBEDDING_CONFIG.SERVER_URL}/upsert`, {
+    const response = await fetch(`${RAG_CONFIG.SERVER_URL}/upsert`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         namespace: 'meeting-assistant',
-        vectors: vectors
+        vectors
       }),
-      signal: AbortSignal.timeout(30000) // 30 second timeout
+      signal: AbortSignal.timeout ? AbortSignal.timeout(30000) : undefined
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
+      const errorText = await response.text().catch(() => '');
       throw new Error(`Upload failed: ${response.status} - ${errorText}`);
     }
 
     const result = await response.json();
     console.log(`✅ Successfully uploaded ${result.upsertedCount || vectors.length} vectors from ${filename}`);
-    
     return result;
 
   } catch (error) {
     console.error(`❌ Failed to upload chunks from ${filename}:`, error);
-    // Don't throw - allow the process to continue with other files
   }
 }
+
 
 
 async function performRAGSearch(query, namespace) {
@@ -590,116 +602,199 @@ function createSimpleChunks(content, filename) {
 
   return chunks;
 }
-  /**
-   * Perform semantic search using backend server - FIXED VERSION
-   */
-  async function performSemanticSearch(query, documentChunks) {
+
+
+function getActiveNamespaces() {
+  const list = [];
+  
+  // 1. Meeting-specific transcript namespace (highest priority)
+  if (selectedMeeting?.meetingId) {
+    list.push(`meeting:${selectedMeeting.meetingId}`);
+  }
+  
+  // 2. Web scraped data namespace for this meeting
+  if (selectedMeeting?.meetingId) {
+    list.push(`web:meeting-${selectedMeeting.meetingId}`);
+  }
+  
+  // 3. Default document namespace
+  list.push('meeting-assistant');
+  
+  // 4. Generic web namespace (for scraped pages not tied to specific meetings)
+  list.push('web');
+  
+  console.log(`🎯 Active namespaces: ${list.join(', ')}`);
+  return list;
+}
+
+// Replace the existing pineconeSearchAcrossNamespaces function with this enhanced version:
+
+async function pineconeSearchAcrossNamespaces(queryEmbedding, topK = 5) {
+  const namespaces = getActiveNamespaces();
+  const allResults = [];
+  const maxPerNamespace = Math.ceil(topK * 1.5); // Get more results per namespace to ensure good coverage
+
+  console.log(`🔍 Searching across ${namespaces.length} namespaces for better coverage...`);
+
+  // Search each namespace in parallel for better performance
+  const searchPromises = namespaces.map(async (ns) => {
     try {
-      console.log(`🔍 Performing semantic search for: "${query}"`);
+      const r = await fetch(`${RAG_CONFIG.SERVER_URL}/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          queryEmbedding,
+          topK: maxPerNamespace,
+          includeMetadata: true,
+          namespace: ns
+        }),
+        signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined
+      });
       
-      // Generate query embedding first
-      const queryEmbedding = await generateEmbedding(query);
-      if (!queryEmbedding) {
-        console.warn('Could not generate query embedding, falling back to keyword search');
-        return [];
-      }
-      
-      // Option 1: Use backend server if available
-      try {
-        const response = await fetch(`${EMBEDDING_CONFIG.SERVER_URL}/search`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ 
-            queryEmbedding: queryEmbedding,
-            topK: EMBEDDING_CONFIG.MAX_DOCUMENTS_FOR_CONTEXT
-          })
+      if (r.ok) {
+        const arr = await r.json();
+        arr.forEach(x => {
+          x._namespace = ns; // Keep track of source namespace
+          x._source = getNamespaceSourceType(ns); // Add human-readable source type
         });
-
-        if (response.ok) {
-          const serverResults = await response.json();
-          console.log(`🎯 Backend search returned ${serverResults.length} results`);
-          return serverResults;
-        }
-      } catch (fetchError) {
-        console.warn('Backend server unavailable, using local search:', fetchError.message);
-      }
-      
-      // Option 2: Local semantic search fallback
-      console.log('🔄 Performing local semantic search...');
-      
-      if (!documentChunks || documentChunks.length === 0) {
-        console.warn('No document chunks available for local search');
+        console.log(`✅ Namespace "${ns}": ${arr.length} results`);
+        return arr;
+      } else {
+        console.warn(`⚠️ Namespace "${ns}" search failed:`, r.status);
         return [];
       }
-      
-      const results = documentChunks
-        .map(chunk => {
-          if (!chunk.embedding) return null;
-          
-          const similarity = cosineSimilarity(queryEmbedding, chunk.embedding);
-          return {
-            id: chunk.id,
-            filename: chunk.filename,
-            chunkIndex: chunk.chunkIndex,
-            content: chunk.content,
-            similarity: similarity,
-            score: similarity * 100 // Convert to percentage
-          };
-        })
-        .filter(result => result && result.similarity >= EMBEDDING_CONFIG.SIMILARITY_THRESHOLD)
-        .sort((a, b) => b.similarity - a.similarity)
-        .slice(0, EMBEDDING_CONFIG.MAX_DOCUMENTS_FOR_CONTEXT);
-
-      console.log(`✅ Local search found ${results.length} relevant chunks`);
-      return results;
-      
-    } catch (error) {
-      console.error('Error in semantic search:', error);
+    } catch (e) {
+      console.warn(`⚠️ Namespace "${ns}" error:`, String(e));
       return [];
     }
-  }
+  });
 
- 
+  // Wait for all searches to complete
+  const results = await Promise.all(searchPromises);
   
+  // Flatten and combine results
+  results.forEach(arr => allResults.push(...arr));
 
-  /**
-   * Merge different types of search results
-   */
+  // Sort by similarity/score and take top results
+  const sorted = allResults
+    .sort((a, b) => (b.similarity ?? b.score ?? 0) - (a.similarity ?? a.score ?? 0))
+    .slice(0, topK);
+
+  console.log(`🎯 Final results: ${sorted.length} from ${new Set(sorted.map(r => r._namespace)).size} namespaces`);
   
-  /**
-   * Build context for AI from search results
-   */
-  function buildEnhancedContext(searchResults) {
-    if (!searchResults || searchResults.length === 0) {
-      return "";
+  // Log source breakdown for debugging
+  const sourceBreakdown = {};
+  sorted.forEach(r => {
+    const source = r._source || r._namespace || 'unknown';
+    sourceBreakdown[source] = (sourceBreakdown[source] || 0) + 1;
+  });
+  console.log(`📊 Source breakdown:`, sourceBreakdown);
+
+  return sorted;
+}
+
+// Add this new helper function to identify namespace source types:
+
+function getNamespaceSourceType(namespace) {
+  if (namespace.startsWith('meeting:')) return 'Meeting Transcript';
+  if (namespace.startsWith('web:')) return 'Web Content';
+  if (namespace === 'meeting-assistant') return 'Drive Files';
+  if (namespace === 'web') return 'Web Pages';
+  return 'Other';
+}
+
+// Update the performSemanticSearch function to use the enhanced multi-namespace search:
+
+async function performSemanticSearch(query, documentChunks) {
+  try {
+    console.log(`🔍 Performing enhanced semantic search for: "${query}"`);
+    const queryEmbedding = await generateEmbedding(query);
+    if (!queryEmbedding) {
+      console.warn('Could not generate query embedding, falling back to keyword search');
+      return [];
     }
 
-    let context = "RELEVANT DOCUMENTS AND CONTEXT:\n\n";
-    
-    searchResults.forEach((result, index) => {
-      context += `Document ${index + 1}: ${result.filename || 'Meeting Transcript'}\n`;
-      context += `Relevance Score: ${(result.similarity || result.score / 10).toFixed(3)}\n`;
-      context += `Type: ${result.type}\n`;
+    // Use enhanced backend search across all namespaces
+    try {
+      const serverResults = await pineconeSearchAcrossNamespaces(
+        queryEmbedding,
+        RAG_CONFIG.MAX_RESULTS || 5
+      );
       
-      if (result.contexts && result.contexts.length > 0) {
-        context += "Content:\n";
-        result.contexts.forEach(ctx => {
-          context += `"${ctx.text}"\n`;
-        });
-      } else if (result.content) {
-        const preview = result.content.length > 500 
-          ? result.content.substring(0, 500) + "..."
-          : result.content;
-        context += `Content: "${preview}"\n`;
+      if (serverResults.length > 0) {
+        console.log('🎯 Enhanced search found results from multiple sources');
+        return serverResults;
       }
-      
-      context += "\n---\n\n";
-    });
+    } catch (fetchError) {
+      console.warn('Enhanced backend search failed, using local fallback:', fetchError?.message);
+    }
 
-    return context;
+    // Local fallback (existing code)
+    console.log('🔄 Performing local semantic search...');
+    if (!Array.isArray(documentChunks) || documentChunks.length === 0) {
+      console.warn('No document chunks available for local search');
+      return [];
+    }
+
+    const results = documentChunks
+      .map(chunk => {
+        if (!chunk.embedding) return null;
+        const similarity = cosineSimilarity(queryEmbedding, chunk.embedding);
+        return {
+          id: chunk.id,
+          filename: chunk.filename,
+          chunkIndex: chunk.chunkIndex,
+          content: chunk.content,
+          similarity,
+          score: similarity * 100,
+          _source: 'Local Files'
+        };
+      })
+      .filter(Boolean)
+      .filter(r => r.similarity >= (RAG_CONFIG.SIMILARITY_THRESHOLD ?? 0.7))
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, RAG_CONFIG.MAX_RESULTS || 5);
+
+    console.log(`✅ Local search found ${results.length} relevant chunks`);
+    return results;
+
+  } catch (error) {
+    console.error('Error in semantic search:', error);
+    return [];
   }
+}
+
+  function buildEnhancedContext(searchResults) {
+  if (!searchResults || searchResults.length === 0) {
+    return "";
+  }
+
+  let context = "RELEVANT INFORMATION FROM MULTIPLE SOURCES:\n\n";
+  
+  searchResults.forEach((result, index) => {
+    const source = result._source || result.filename || 'Unknown Source';
+    const relevanceScore = (result.similarity || result.score / 10 || 0).toFixed(3);
+    
+    context += `Source ${index + 1}: ${source}\n`;
+    context += `Relevance Score: ${relevanceScore}\n`;
+    
+    if (result.contexts && result.contexts.length > 0) {
+      context += "Content:\n";
+      result.contexts.forEach(ctx => {
+        context += `"${ctx.text}"\n`;
+      });
+    } else if (result.content) {
+      const preview = result.content.length > 500 
+        ? result.content.substring(0, 500) + "..."
+        : result.content;
+      context += `Content: "${preview}"\n`;
+    }
+    
+    context += "\n---\n\n";
+  });
+
+  return context;
+}
 
   // Continue with the rest of your existing code...
   // [The rest of your functions remain the same]
@@ -1354,19 +1449,19 @@ function buildDocumentContext(ragResults) {
   return context;
 }
 
-  function highlightSearchTerms(text, searchTerms) {
-    if (!searchTerms || searchTerms.length === 0) return text;
+function highlightSearchTerms(text, searchTerms) {
+  if (!searchTerms || searchTerms.length === 0) return text;
+  let highlightedText = text;
 
-    let highlightedText = text;
+  searchTerms.forEach(term => {
+    const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`\\b(${escapedTerm})\\b`, 'gi');
+    highlightedText = highlightedText.replace(regex, '<mark>$1</mark>');
+  });
 
-    searchTerms.forEach(term => {
-        const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\      meeting_transcript');
-        const regex = new RegExp(`\\b(${escapedTerm})\\b`, 'gi');
-        highlightedText = highlightedText.replace(regex, '<mark>$1</mark>');
-    });
+  return highlightedText;
+}
 
-    return highlightedText;
-  }
 
   function getMeetingStatus(meetingDateStr) {
     const today = new Date();
@@ -2022,8 +2117,6 @@ async function preloadDriveFiles() {
 
   try {
     console.log("🔄 Loading Drive files...");
-    
-    // Load the uploaded files list first
     await loadUploadedFilesList();
     
     const token = await getAuthToken();
@@ -2036,22 +2129,17 @@ async function preloadDriveFiles() {
       f.mimeType === "application/pdf" ||
       f.mimeType === "text/csv" ||
       f.mimeType === "application/vnd.google-apps.spreadsheet" ||
-      f.mimeType === "application/vnd.openxmlformats-officedocument.presentationml.presentation" // ✅ PPTX support
+      f.mimeType === "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     );
 
     console.log(`📂 Found ${supportedFiles.length} supported files in Drive`);
     console.log(`📦 Already processed files: ${Array.from(uploadedFiles).join(', ')}`);
 
-    // Load content only for files that haven't been uploaded yet
     const filesToProcess = {};
-    let newFilesCount = 0;
-    
     for (const file of supportedFiles.slice(0, 10)) {
       if (file.size && parseInt(file.size) >= 5000000) continue;
 
       const normalizedFilename = normalizeFilename(file.name);
-      
-      // Skip if already uploaded
       if (uploadedFiles.has(normalizedFilename)) {
         console.log(`⏭️ Skipping already processed file: ${file.name}`);
         continue;
@@ -2062,26 +2150,34 @@ async function preloadDriveFiles() {
         const content = await downloadFileContent(file, token);
         if (content && content.trim().length > 0) {
           filesToProcess[file.name.toLowerCase()] = content;
-          filesContentMap[file.name.toLowerCase()] = content; // Keep for local search
-          newFilesCount++;
+          filesContentMap[file.name.toLowerCase()] = content; // keep for local search
         }
       } catch (error) {
         console.warn(`Failed to load ${file.name}:`, error);
       }
     }
 
-    // Only upload if there are new files to process
     if (Object.keys(filesToProcess).length > 0) {
       console.log(`📤 Uploading ${Object.keys(filesToProcess).length} new files to vector database...`);
       await processAndUploadDocuments(filesToProcess);
     } else {
       console.log(`✅ All files already processed. RAG system ready with ${uploadedFiles.size} documents`);
     }
-    
+
+    // 🔗 NEW: scan file contents for external links and index them into Pinecone
+    try {
+      const nsHint = selectedMeeting?.meetingId ? `meeting:${selectedMeeting.meetingId}` : undefined;
+      const res = await indexUrlsFromFiles(filesContentMap, nsHint, 1500);
+      console.log('🌐 Link indexing summary:', res);
+    } catch (e) {
+      console.warn('External link indexing issue:', e);
+    }
+
   } catch (error) {
     console.warn("Failed to setup RAG system:", error);
   }
 }
+
 
 // Enhanced chat input handler with semantic search
 // Enhanced chat input handler with proper Drive file routing
@@ -2097,30 +2193,101 @@ chatInput.addEventListener("keydown", async (e) => {
 
   chatInput.value = "";
 
-  // Add user message to conversation history
+  // Add user message to conversation history + UI
   conversationHistory.push({ role: "user", content: input });
 
-  // Add user message to UI
   const userBubble = document.createElement("div");
   userBubble.className = "chat-bubble user-bubble";
   userBubble.textContent = input;
   chatMessages.appendChild(userBubble);
-  
-  // ✅ FIXED: Scroll after user message with force
   scrollToBottom(true);
 
-  // Add AI thinking bubble
   const aiBubble = document.createElement("div");
   aiBubble.className = "chat-bubble ai-bubble";
   aiBubble.innerHTML = '<div class="typing-indicator">🔍 Processing your request...</div>';
   chatMessages.appendChild(aiBubble);
-  
-  // ✅ FIXED: Scroll after AI thinking bubble
   scrollToBottom(true);
 
   try {
-    // ... your existing logic for handling different query types ...
-    
+    // --- Fast path A: If the user pasted a URL, do URL-based Q&A ---
+    if (isUrlLike(input)) {
+      try {
+        aiBubble.innerHTML = '<div class="typing-indicator">🌐 Scraping the page…</div>';
+        const { title, url, text } = await scrapeUrl(input);
+
+        aiBubble.innerHTML = '<div class="typing-indicator">🧠 Answering from that page…</div>';
+
+        // If the user only pasted a URL (no other words), default to a summary-style question
+        let question = `Please answer based on that page: ${input}`;
+        const onlyUrl = /^https?:\/\/\S+$/i.test(input.trim());
+        if (onlyUrl) {
+          question = [
+            `Summarize the page in 5 concise bullet points, then list 5 key facts/numbers/dates.`,
+            `If it's about a person, include a 2‑line bio and most recent major roles/events.`,
+            `Stick strictly to the scraped content.`
+          ].join(' ');
+        }
+
+        const messages = buildMessagesForUrlQA(question, text);
+        const answer = await getAIResponse(messages);
+
+
+        aiBubble.innerHTML = `${linkify(answer)}<div style="margin-top:8px;font-size:.85em;color:#666">🔗 Source: <a href="${url}" target="_blank" rel="noopener noreferrer">${title || url}</a></div>`;
+
+        // Fire-and-forget: index this page for future RAG (meeting-aware)
+        const nsHint = selectedMeeting?.meetingId ? `meeting:${selectedMeeting.meetingId}` : undefined;
+        scrapeAndUpsert(input, nsHint).catch(()=>{});
+
+      } catch (err) {
+        console.error(err);
+        aiBubble.innerHTML = "⚠️ Failed to scrape that page. Please check the URL and try again.";
+      }
+
+      // Save both messages
+      if (userUid && selectedMeeting?.meetingId) {
+        const responseText = aiBubble.textContent || aiBubble.innerText;
+        saveChatMessage(userUid, selectedMeeting.meetingId, "user", input);
+        saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", responseText);
+      }
+
+      isProcessing = false;
+      scrollToBottom(true);
+      return;
+    }
+
+    // --- Fast path B: "web-search-y" queries -> SERP ---
+    if (detectWebSearchyQuery(input)) {
+      try {
+        aiBubble.innerHTML = '<div class="typing-indicator">🔎 Searching the web…</div>';
+        const results = await serpSearch(input);
+        if (!results.length) {
+          aiBubble.innerHTML = "No web results found.";
+        } else {
+          let brief = `Here are relevant results:\n\n`;
+          const top = results.slice(0, 5);
+          top.forEach((r, i) => {
+            brief += `${i+1}. ${r.title}\n${r.snippet || ''}\n${r.link}\n\n`;
+          });
+          aiBubble.innerHTML = linkify(brief.trim());
+        }
+      } catch (err) {
+        console.error(err);
+        aiBubble.innerHTML = "⚠️ Web search failed.";
+      }
+
+      // Save both messages
+      if (userUid && selectedMeeting?.meetingId) {
+        const responseText = aiBubble.textContent || aiBubble.innerText;
+        saveChatMessage(userUid, selectedMeeting.meetingId, "user", input);
+        saveChatMessage(userUid, selectedMeeting.meetingId, "assistant", responseText);
+      }
+
+      isProcessing = false;
+      scrollToBottom(true);
+      return;
+    }
+
+    // --- Otherwise: your normal RAG flow ---
     const intent = analyzeQuestionIntent(input);
     console.log(`🎯 Detected intent: ${intent}`);
 
@@ -2131,15 +2298,15 @@ chatInput.addEventListener("keydown", async (e) => {
     } else {
       aiBubble.innerHTML = '<div class="typing-indicator">🔍 Searching knowledge base...</div>';
       const ragResponse = await getRAGResponseWithContext(input, selectedMeeting, userUid, filesContentMap, getAIResponse);
-      
+
       conversationHistory.push({ role: "assistant", content: ragResponse.response });
-      
+
       if (conversationHistory.length > MAX_CONVERSATION_HISTORY * 2) {
         conversationHistory = conversationHistory.slice(-MAX_CONVERSATION_HISTORY * 2);
       }
-      
+
       aiBubble.innerHTML = linkify(ragResponse.response);
-      
+
       if (ragResponse.hasResults) {
         const contextInfo = document.createElement("div");
         contextInfo.style.cssText = "font-size: 0.8em; color: #666; margin-top: 8px; font-style: italic;";
@@ -2149,13 +2316,11 @@ chatInput.addEventListener("keydown", async (e) => {
 
       if (voiceReplyToggle && voiceReplyToggle.checked && synth) {
         console.log("🔊 Voice reply enabled, speaking response");
-        setTimeout(() => {
-          speakResponse(ragResponse.response || aiBubble.textContent);
-        }, 500);
+        setTimeout(() => speakResponse(ragResponse.response || aiBubble.textContent), 500);
       }
     }
 
-    // Save to chat history in Firebase (for all response types)
+    // Save to chat history
     if (userUid && selectedMeeting?.meetingId) {
       const responseText = aiBubble.textContent || aiBubble.innerText;
       saveChatMessage(userUid, selectedMeeting.meetingId, "user", input);
@@ -2168,10 +2333,9 @@ chatInput.addEventListener("keydown", async (e) => {
   }
 
   isProcessing = false;
-  
-  // ✅ FIXED: Final scroll after everything is complete
   scrollToBottom(true);
 });
+
 
 
 function isDriveFileListRequest(query) {
